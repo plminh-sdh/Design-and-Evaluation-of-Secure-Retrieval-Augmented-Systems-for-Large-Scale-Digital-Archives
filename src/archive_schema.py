@@ -208,6 +208,34 @@ def _extract_caption_segments(text: str) -> List[str]:
     return segments
 
 
+def _is_layout_segment(line: str) -> bool:
+    normalized_line = normalize_text(line)
+    return bool(
+        re.match(
+            r"^(ocr\s+)?(line|block|region)\s+\d+(\s+\[[^\]]+\])?\s*:",
+            normalized_line,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _extract_layout_segments(text: str) -> List[str]:
+    segments = [
+        normalize_text(line)
+        for line in normalize_text(text).split("\n")
+        if normalize_text(line)
+    ]
+
+    if len(segments) < 2:
+        return []
+
+    layout_like_count = sum(1 for segment in segments if _is_layout_segment(segment))
+    if layout_like_count / len(segments) < 0.5:
+        return []
+
+    return segments
+
+
 def _chunk_segments_by_words(
     segments: List[str],
     max_words: int,
@@ -300,6 +328,19 @@ def _chunk_captions_by_words(
     )
 
 
+def _chunk_layout_segments_by_words(
+    segments: List[str],
+    max_words: int,
+    overlap_words: int,
+) -> List[str]:
+    return _chunk_segments_by_words(
+        segments,
+        max_words=max_words,
+        overlap_words=overlap_words,
+        separator="\n",
+    )
+
+
 def _looks_like_flattened_article(text: str) -> bool:
     return bool(re.search(r"(?<=[.!?])\s+(?=[A-Z][a-z])", normalize_text(text)))
 
@@ -342,15 +383,15 @@ def chunk_text_by_words(
 
     If the text looks like timestamped caption segments, e.g.
     ``Segment 1 [0.00s-10.00s]: a person is cooking``, chunks are built
-    from whole caption segments. If the text looks like newline-separated
+    from whole caption segments. If the text looks like OCR layout lines,
+    e.g. ``OCR Line 1 [10,20,300,40]: invoice total``, chunks are built
+    from whole OCR/layout segments. If the text looks like newline-separated
     transcript turns, e.g.
     ``Speaker: utterance``, chunks are built from whole turns so speaker
     labels and utterances stay together. Otherwise, it uses paragraph-aware
     article chunking when paragraphs can be detected. If no structure is
     available, it falls back to a plain sliding word window.
 
-    TODO: extend this with additional modality-aware chunking:
-    - layout-aware chunking for DocVQA
     """
     if max_words <= 0:
         raise ValueError("max_words must be greater than 0")
@@ -366,6 +407,14 @@ def chunk_text_by_words(
     if captions:
         return _chunk_captions_by_words(
             captions,
+            max_words=max_words,
+            overlap_words=overlap_words,
+        )
+
+    layout_segments = _extract_layout_segments(normalized_text)
+    if layout_segments:
+        return _chunk_layout_segments_by_words(
+            layout_segments,
             max_words=max_words,
             overlap_words=overlap_words,
         )
