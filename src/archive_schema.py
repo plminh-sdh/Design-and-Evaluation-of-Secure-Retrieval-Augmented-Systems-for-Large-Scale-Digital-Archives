@@ -180,6 +180,34 @@ def _extract_paragraphs(text: str) -> List[str]:
     return paragraphs
 
 
+def _is_caption_segment(line: str) -> bool:
+    normalized_line = normalize_text(line)
+    return bool(
+        re.match(
+            r"^(segment\s+\d+\s+)?\[\d+(?:\.\d+)?s?-\d+(?:\.\d+)?s?\]\s*:",
+            normalized_line,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _extract_caption_segments(text: str) -> List[str]:
+    segments = [
+        normalize_text(line)
+        for line in normalize_text(text).split("\n")
+        if normalize_text(line)
+    ]
+
+    if len(segments) < 2:
+        return []
+
+    segment_like_count = sum(1 for segment in segments if _is_caption_segment(segment))
+    if segment_like_count / len(segments) < 0.5:
+        return []
+
+    return segments
+
+
 def _chunk_segments_by_words(
     segments: List[str],
     max_words: int,
@@ -259,6 +287,19 @@ def _chunk_paragraphs_by_words(
     )
 
 
+def _chunk_captions_by_words(
+    captions: List[str],
+    max_words: int,
+    overlap_words: int,
+) -> List[str]:
+    return _chunk_segments_by_words(
+        captions,
+        max_words=max_words,
+        overlap_words=overlap_words,
+        separator="\n",
+    )
+
+
 def _looks_like_flattened_article(text: str) -> bool:
     return bool(re.search(r"(?<=[.!?])\s+(?=[A-Z][a-z])", normalize_text(text)))
 
@@ -297,16 +338,18 @@ def chunk_text_by_words(
     max_words: int = 350,
     overlap_words: int = 60,
 ) -> List[str]:
-    """Chunk text by words, preserving transcript turns when possible.
+    """Chunk text by words while preserving detected source structure.
 
-    If the text looks like newline-separated transcript turns, e.g.
+    If the text looks like timestamped caption segments, e.g.
+    ``Segment 1 [0.00s-10.00s]: a person is cooking``, chunks are built
+    from whole caption segments. If the text looks like newline-separated
+    transcript turns, e.g.
     ``Speaker: utterance``, chunks are built from whole turns so speaker
     labels and utterances stay together. Otherwise, it uses paragraph-aware
     article chunking when paragraphs can be detected. If no structure is
     available, it falls back to a plain sliding word window.
 
     TODO: extend this with additional modality-aware chunking:
-    - caption/segment-aware chunking for MSR-VTT
     - layout-aware chunking for DocVQA
     """
     if max_words <= 0:
@@ -318,6 +361,14 @@ def chunk_text_by_words(
     normalized_text = normalize_text(text)
     if not normalized_text:
         return []
+
+    captions = _extract_caption_segments(normalized_text)
+    if captions:
+        return _chunk_captions_by_words(
+            captions,
+            max_words=max_words,
+            overlap_words=overlap_words,
+        )
 
     turns = _extract_transcript_turns(normalized_text)
     if turns:
