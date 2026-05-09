@@ -167,56 +167,129 @@ def _extract_transcript_turns(text: str) -> List[str]:
     return turns
 
 
-def _chunk_turns_by_words(
-    turns: List[str],
+def _extract_paragraphs(text: str) -> List[str]:
+    paragraphs = [
+        normalize_text(paragraph)
+        for paragraph in re.split(r"\n\s*\n", normalize_text(text))
+        if normalize_text(paragraph)
+    ]
+
+    if len(paragraphs) < 2:
+        return []
+
+    return paragraphs
+
+
+def _chunk_segments_by_words(
+    segments: List[str],
     max_words: int,
     overlap_words: int,
+    separator: str,
 ) -> List[str]:
     chunks: List[str] = []
     start = 0
 
-    while start < len(turns):
-        current_turns: List[str] = []
+    while start < len(segments):
+        current_segments: List[str] = []
         current_words = 0
         index = start
 
-        while index < len(turns):
-            turn = turns[index]
-            turn_words = _word_count(turn)
+        while index < len(segments):
+            segment = segments[index]
+            segment_words = _word_count(segment)
 
-            if turn_words > max_words and not current_turns:
-                chunks.extend(_chunk_words(turn, max_words=max_words, overlap_words=overlap_words))
+            if segment_words > max_words and not current_segments:
+                chunks.extend(_chunk_words(segment, max_words=max_words, overlap_words=overlap_words))
                 index += 1
                 break
 
-            if current_turns and current_words + turn_words > max_words:
+            if current_segments and current_words + segment_words > max_words:
                 break
 
-            current_turns.append(turn)
-            current_words += turn_words
+            current_segments.append(segment)
+            current_words += segment_words
             index += 1
 
             if current_words >= max_words:
                 break
 
-        if current_turns:
-            chunks.append("\n".join(current_turns))
+        if current_segments:
+            chunks.append(separator.join(current_segments))
 
-        if index >= len(turns):
+        if index >= len(segments):
             break
 
         overlap_count = 0
         overlap_total = 0
-        for turn in reversed(current_turns):
+        for segment in reversed(current_segments):
             if overlap_total >= overlap_words:
                 break
-            overlap_total += _word_count(turn)
+            overlap_total += _word_count(segment)
             overlap_count += 1
 
         next_start = index - overlap_count
         start = next_start if next_start > start else index
 
     return chunks
+
+
+def _chunk_turns_by_words(
+    turns: List[str],
+    max_words: int,
+    overlap_words: int,
+) -> List[str]:
+    return _chunk_segments_by_words(
+        turns,
+        max_words=max_words,
+        overlap_words=overlap_words,
+        separator="\n",
+    )
+
+
+def _chunk_paragraphs_by_words(
+    paragraphs: List[str],
+    max_words: int,
+    overlap_words: int,
+) -> List[str]:
+    return _chunk_segments_by_words(
+        paragraphs,
+        max_words=max_words,
+        overlap_words=overlap_words,
+        separator="\n\n",
+    )
+
+
+def _looks_like_flattened_article(text: str) -> bool:
+    return bool(re.search(r"(?<=[.!?])\s+(?=[A-Z][a-z])", normalize_text(text)))
+
+
+def _split_flattened_article_paragraphs(text: str) -> List[str]:
+    normalized_text = normalize_text(text)
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z][a-z])", normalized_text)
+    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+
+    if len(sentences) < 4:
+        return []
+
+    paragraphs: List[str] = []
+    current_sentences: List[str] = []
+    current_words = 0
+    target_words = 120
+
+    for sentence in sentences:
+        sentence_words = _word_count(sentence)
+        if current_sentences and current_words + sentence_words > target_words:
+            paragraphs.append(" ".join(current_sentences))
+            current_sentences = []
+            current_words = 0
+
+        current_sentences.append(sentence)
+        current_words += sentence_words
+
+    if current_sentences:
+        paragraphs.append(" ".join(current_sentences))
+
+    return paragraphs if len(paragraphs) > 1 else []
 
 
 def chunk_text_by_words(
@@ -228,11 +301,11 @@ def chunk_text_by_words(
 
     If the text looks like newline-separated transcript turns, e.g.
     ``Speaker: utterance``, chunks are built from whole turns so speaker
-    labels and utterances stay together. Otherwise, this falls back to a
-    plain sliding word window.
+    labels and utterances stay together. Otherwise, it uses paragraph-aware
+    article chunking when paragraphs can be detected. If no structure is
+    available, it falls back to a plain sliding word window.
 
     TODO: extend this with additional modality-aware chunking:
-    - paragraph-aware chunking for CNN/DailyMail
     - caption/segment-aware chunking for MSR-VTT
     - layout-aware chunking for DocVQA
     """
@@ -250,6 +323,17 @@ def chunk_text_by_words(
     if turns:
         return _chunk_turns_by_words(
             turns,
+            max_words=max_words,
+            overlap_words=overlap_words,
+        )
+
+    paragraphs = _extract_paragraphs(normalized_text)
+    if not paragraphs and _looks_like_flattened_article(normalized_text):
+        paragraphs = _split_flattened_article_paragraphs(normalized_text)
+
+    if paragraphs:
+        return _chunk_paragraphs_by_words(
+            paragraphs,
             max_words=max_words,
             overlap_words=overlap_words,
         )
