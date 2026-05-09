@@ -1,6 +1,4 @@
-"""
-    Common archive schema definitions for the database layer.
-"""
+"""Common archive schema definitions for the database layer."""
 
 import hashlib
 import json
