@@ -99,24 +99,21 @@ def normalize_text(text: Any) -> str:
         text = "\n".join(str(item) for item in text)
 
     text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\\'", "'").replace('\\"', '"')
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def chunk_text_by_words(
-    text: str,
-    max_words: int = 350,
-    overlap_words: int = 60,
-) -> List[str]:
-    """Simple word-based chunking baseline.
+def _word_count(text: str) -> int:
+    return len(normalize_text(text).split())
 
-    TODO: replace or extend this with modality-aware chunking:
-    - transcript turn-aware chunking for MediaSum
-    - paragraph-aware chunking for CNN/DailyMail
-    - caption/segment-aware chunking for MSR-VTT
-    - layout-aware chunking for DocVQA
-    """
+
+def _chunk_words(
+    text: str,
+    max_words: int,
+    overlap_words: int,
+) -> List[str]:
     words = normalize_text(text).split()
     if not words:
         return []
@@ -133,6 +130,135 @@ def chunk_text_by_words(
         start += step
 
     return chunks
+
+
+def _is_transcript_turn(line: str) -> bool:
+    """Return whether a line looks like a speaker turn."""
+    if ":" not in line:
+        return False
+
+    speaker, utterance = line.split(":", 1)
+    speaker = speaker.strip()
+    utterance = utterance.strip()
+
+    if not speaker or not utterance:
+        return False
+
+    if len(speaker.split()) > 8:
+        return False
+
+    return bool(re.search(r"[A-Za-z0-9]", speaker))
+
+
+def _extract_transcript_turns(text: str) -> List[str]:
+    turns = [
+        normalize_text(line)
+        for line in normalize_text(text).split("\n")
+        if normalize_text(line)
+    ]
+
+    if len(turns) < 2:
+        return []
+
+    turn_like_count = sum(1 for turn in turns if _is_transcript_turn(turn))
+    if turn_like_count / len(turns) < 0.5:
+        return []
+
+    return turns
+
+
+def _chunk_turns_by_words(
+    turns: List[str],
+    max_words: int,
+    overlap_words: int,
+) -> List[str]:
+    chunks: List[str] = []
+    start = 0
+
+    while start < len(turns):
+        current_turns: List[str] = []
+        current_words = 0
+        index = start
+
+        while index < len(turns):
+            turn = turns[index]
+            turn_words = _word_count(turn)
+
+            if turn_words > max_words and not current_turns:
+                chunks.extend(_chunk_words(turn, max_words=max_words, overlap_words=overlap_words))
+                index += 1
+                break
+
+            if current_turns and current_words + turn_words > max_words:
+                break
+
+            current_turns.append(turn)
+            current_words += turn_words
+            index += 1
+
+            if current_words >= max_words:
+                break
+
+        if current_turns:
+            chunks.append("\n".join(current_turns))
+
+        if index >= len(turns):
+            break
+
+        overlap_count = 0
+        overlap_total = 0
+        for turn in reversed(current_turns):
+            if overlap_total >= overlap_words:
+                break
+            overlap_total += _word_count(turn)
+            overlap_count += 1
+
+        next_start = index - overlap_count
+        start = next_start if next_start > start else index
+
+    return chunks
+
+
+def chunk_text_by_words(
+    text: str,
+    max_words: int = 350,
+    overlap_words: int = 60,
+) -> List[str]:
+    """Chunk text by words, preserving transcript turns when possible.
+
+    If the text looks like newline-separated transcript turns, e.g.
+    ``Speaker: utterance``, chunks are built from whole turns so speaker
+    labels and utterances stay together. Otherwise, this falls back to a
+    plain sliding word window.
+
+    TODO: extend this with additional modality-aware chunking:
+    - paragraph-aware chunking for CNN/DailyMail
+    - caption/segment-aware chunking for MSR-VTT
+    - layout-aware chunking for DocVQA
+    """
+    if max_words <= 0:
+        raise ValueError("max_words must be greater than 0")
+
+    if overlap_words < 0:
+        raise ValueError("overlap_words cannot be negative")
+
+    normalized_text = normalize_text(text)
+    if not normalized_text:
+        return []
+
+    turns = _extract_transcript_turns(normalized_text)
+    if turns:
+        return _chunk_turns_by_words(
+            turns,
+            max_words=max_words,
+            overlap_words=overlap_words,
+        )
+
+    return _chunk_words(
+        normalized_text,
+        max_words=max_words,
+        overlap_words=overlap_words,
+    )
 
 
 def apply_security_masking_placeholder(text: str) -> Tuple[str, List[Dict[str, Any]], str, str]:
