@@ -39,6 +39,7 @@ class BGEM3Embedder:
         model_name: str = BGE_M3_MODEL_NAME,
         use_fp16: bool = True,
         device: Optional[str] = None,
+        require_cuda: bool = False,
     ) -> None:
         try:
             from FlagEmbedding import BGEM3FlagModel
@@ -48,11 +49,13 @@ class BGEM3Embedder:
                 "Install it with: pip install -U FlagEmbedding"
             ) from exc
 
+        resolved_device = self._resolve_device(device, require_cuda=require_cuda)
         model_kwargs: Dict[str, Any] = {"use_fp16": use_fp16}
-        if device:
-            model_kwargs["device"] = device
+        if resolved_device:
+            model_kwargs["device"] = resolved_device
 
         self.model_name = model_name
+        self.device = resolved_device or "auto"
         self.model = BGEM3FlagModel(model_name, **model_kwargs)
 
     def encode_texts(
@@ -99,6 +102,34 @@ class BGEM3Embedder:
             batch_size=batch_size,
             max_length=max_length,
         )
+
+    @staticmethod
+    def _resolve_device(device: Optional[str], require_cuda: bool = False) -> Optional[str]:
+        if not device and not require_cuda:
+            return None
+
+        try:
+            import torch
+        except ImportError as exc:
+            if require_cuda or device == "cuda":
+                raise RuntimeError(
+                    "CUDA was requested for BGE-M3, but PyTorch is not installed."
+                ) from exc
+            return device
+
+        if device == "cuda" or require_cuda:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA was requested for BGE-M3, but this Python environment has "
+                    "CPU-only PyTorch or cannot see the GPU. Install a CUDA-enabled "
+                    "PyTorch build, then restart the notebook kernel."
+                )
+            return "cuda"
+
+        if device == "auto":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+
+        return device
 
     @staticmethod
     def _dense_to_list(vector: Any) -> List[float]:
