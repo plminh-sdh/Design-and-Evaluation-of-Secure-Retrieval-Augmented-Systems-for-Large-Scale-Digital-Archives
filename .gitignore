@@ -12,3 +12,7 @@ htmlcov/
 
 # Jupyter cache/checkpoints
 .ipynb_checkpoints/
+
+# data and context files
+data/
+*.md
