@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import pandas as pd
 
-from src.archive_schema import ArchiveChunk, stable_id
-from src.graph_kb_skeleton import dataframe_to_graph_csv
+from src.archive_schema import ArchiveChunk, dataframe_to_csv, stable_id
+from src.graph_kb_skeleton import GRAPH_JSON_COLUMNS
 
 
 MENTION_EXPORT_DIR = Path("data") / "graph_kb_exports" / "step_02_mentions"
@@ -113,6 +113,10 @@ def export_mention_tables(
 
     for table_name, table in tables.items():
         csv_path = export_path / f"{table_name}.csv"
-        exported_paths[table_name] = dataframe_to_graph_csv(table, csv_path)
+        exported_paths[table_name] = dataframe_to_csv(
+            table,
+            csv_path,
+            json_columns=GRAPH_JSON_COLUMNS,
+        )
 
     return exported_paths

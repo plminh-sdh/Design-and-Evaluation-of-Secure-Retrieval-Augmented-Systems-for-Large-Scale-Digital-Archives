@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import pandas as pd
 
-from src.archive_schema import ArchiveChunk
+from src.archive_schema import ArchiveChunk, dataframe_to_csv
 
 
 GRAPH_EXPORT_DIR = Path("data") / "graph_kb_exports" / "step_01_archive_skeleton"
@@ -17,31 +16,6 @@ GRAPH_JSON_COLUMNS = [
     "source_metadata",
     "sensitive_entities",
 ]
-
-
-def _json_serialize_cell(value: Any) -> Any:
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
-def dataframe_to_graph_csv(
-    df: pd.DataFrame,
-    csv_path: str | Path,
-    json_columns: Sequence[str] = GRAPH_JSON_COLUMNS,
-    index: bool = False,
-) -> Path:
-    """Write a graph import table, JSON-encoding nested columns."""
-    path = Path(csv_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    export_df = df.copy()
-    for column in json_columns:
-        if column in export_df.columns:
-            export_df[column] = export_df[column].map(_json_serialize_cell)
-
-    export_df.to_csv(path, index=index)
-    return path
 
 
 def _chunk_value(chunk: ArchiveChunk | Mapping[str, Any], field_name: str) -> Any:
@@ -195,6 +169,10 @@ def export_archive_skeleton_tables(
 
     for table_name, table in tables.items():
         csv_path = export_path / f"{table_name}.csv"
-        exported_paths[table_name] = dataframe_to_graph_csv(table, csv_path)
+        exported_paths[table_name] = dataframe_to_csv(
+            table,
+            csv_path,
+            json_columns=GRAPH_JSON_COLUMNS,
+        )
 
     return exported_paths

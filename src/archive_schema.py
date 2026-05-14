@@ -6,7 +6,10 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import pandas as pd
 
 
 class DatasetName(str, Enum):
@@ -80,6 +83,74 @@ class ArchiveChunk:
     source_metadata: Dict[str, Any] = field(default_factory=dict)
     dense_vector_ready: bool = False
     sparse_vector_ready: bool = False
+
+
+CSV_CACHE_DIR = Path("data") / "csv_cache"
+CSV_JSON_COLUMNS = ["source_metadata", "sensitive_entities"]
+
+
+def json_serialize_cell(value: Any) -> Any:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def json_parse_cell(value: Any) -> Any:
+    if pd.isna(value) or value == "":
+        return None
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def dataframe_to_csv(
+    df: pd.DataFrame,
+    csv_path: str | Path,
+    json_columns: Optional[Sequence[str]] = None,
+    index: bool = False,
+) -> Path:
+    """Export a dataframe to CSV, JSON-encoding nested dict/list columns first."""
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    export_df = df.copy()
+    for column in json_columns or []:
+        if column in export_df.columns:
+            export_df[column] = export_df[column].map(json_serialize_cell)
+
+    export_df.to_csv(path, index=index)
+    print(f"Saved {len(export_df):,} rows to {path}")
+    return path
+
+
+def csv_to_dataframe(
+    csv_path: str | Path,
+    json_columns: Optional[Sequence[str]] = None,
+    **read_csv_kwargs: Any,
+) -> pd.DataFrame:
+    """Read a CSV into a dataframe, decoding JSON columns created by dataframe_to_csv."""
+    df = pd.read_csv(csv_path, **read_csv_kwargs)
+
+    for column in json_columns or []:
+        if column in df.columns:
+            df[column] = df[column].map(json_parse_cell)
+
+    return df
+
+
+def archive_documents_to_dataframe(documents: List[ArchiveDocument]) -> pd.DataFrame:
+    return pd.DataFrame([asdict(document) for document in documents])
+
+
+def dataset_cache_paths(dataset_slug: str) -> Tuple[Path, Path]:
+    safe_slug = dataset_slug.lower().replace("/", "_").replace(" ", "_")
+    return (
+        CSV_CACHE_DIR / f"{safe_slug}_documents.csv",
+        CSV_CACHE_DIR / f"{safe_slug}_chunks.csv",
+    )
 
 
 def stable_id(*parts: Any, length: int = 24) -> str:
@@ -496,3 +567,7 @@ def archive_chunk_to_qdrant_payload(chunk: ArchiveChunk) -> Dict[str, Any]:
     Embedding vectors will be attached later when we implement dense/sparse embedding.
     """
     return asdict(chunk)
+
+
+def archive_chunks_to_dataframe(chunks: List[ArchiveChunk]) -> pd.DataFrame:
+    return pd.DataFrame([archive_chunk_to_qdrant_payload(chunk) for chunk in chunks])
