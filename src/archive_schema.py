@@ -141,6 +141,63 @@ def csv_to_dataframe(
     return df
 
 
+def json_safe_value(value: Any) -> Any:
+    """Convert common pandas/numpy values into JSON-serializable values."""
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe_value(item) for item in value]
+
+    if hasattr(value, "item"):
+        return json_safe_value(value.item())
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, Path):
+        return str(value)
+
+    return value
+
+
+def dataframe_to_jsonl(
+    df: pd.DataFrame,
+    jsonl_path: str | Path,
+) -> Path:
+    """Export a dataframe to JSONL, preserving nested dict/list columns."""
+    path = Path(jsonl_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8") as handle:
+        for record in df.to_dict(orient="records"):
+            safe_record = json_safe_value(record)
+            handle.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
+
+    print(f"Saved {len(df):,} rows to {path}")
+    return path
+
+
+def jsonl_to_dataframe(jsonl_path: str | Path) -> pd.DataFrame:
+    """Read a JSONL file into a dataframe."""
+    path = Path(jsonl_path)
+    records = []
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    return pd.DataFrame(records)
+
+
 def archive_documents_to_dataframe(documents: List[ArchiveDocument]) -> pd.DataFrame:
     return pd.DataFrame([asdict(document) for document in documents])
 
