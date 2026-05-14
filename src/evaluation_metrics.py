@@ -74,6 +74,31 @@ def _valid_mentions(
     return valid_mentions
 
 
+def _deduplicate_mentions(
+    mentions: Sequence[Mapping[str, Any]],
+    *,
+    require_label_match: bool = True,
+) -> List[Mapping[str, Any]]:
+    """Remove repeated mention spans before scoring.
+
+    The evaluator scores span and optional label equality, so duplicate input
+    rows with the same scoring identity should count once.
+    """
+    deduplicated = []
+    seen = set()
+    for mention in mentions:
+        key = (
+            _mention_start(mention),
+            _mention_end(mention),
+            _mention_label(mention) if require_label_match else None,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(mention)
+    return deduplicated
+
+
 def mention_matches(
     prediction: Mapping[str, Any],
     gold: Mapping[str, Any],
@@ -110,8 +135,14 @@ def evaluate_mention_lists(
     require_label_match: bool = True,
 ) -> Dict[str, Any]:
     """Evaluate one predicted mention list against one gold mention list."""
-    predictions = _valid_mentions(predictions)
-    gold_mentions = _valid_mentions(gold_mentions)
+    predictions = _deduplicate_mentions(
+        _valid_mentions(predictions),
+        require_label_match=require_label_match,
+    )
+    gold_mentions = _deduplicate_mentions(
+        _valid_mentions(gold_mentions),
+        require_label_match=require_label_match,
+    )
 
     matched_gold_indexes = set()
     true_positive = 0
@@ -181,6 +212,195 @@ def evaluate_mention_records(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def _mention_overlap_length(
+    prediction: Mapping[str, Any],
+    gold: Mapping[str, Any],
+) -> int:
+    pred_start = _mention_start(prediction)
+    pred_end = _mention_end(prediction)
+    gold_start = _mention_start(gold)
+    gold_end = _mention_end(gold)
+    if None in {pred_start, pred_end, gold_start, gold_end}:
+        return 0
+    return max(0, min(pred_end, gold_end) - max(pred_start, gold_start))
+
+
+def _best_unmatched_mention(
+    mention: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    matched_indexes: set[int],
+    *,
+    mode: str,
+    require_label_match: bool,
+) -> Optional[int]:
+    best_index = None
+    best_score: Tuple[int, int] = (0, 0)
+
+    for candidate_index, candidate in enumerate(candidates):
+        if candidate_index in matched_indexes:
+            continue
+        if not mention_matches(
+            mention,
+            candidate,
+            mode=mode,
+            require_label_match=require_label_match,
+        ):
+            continue
+
+        overlap = _mention_overlap_length(mention, candidate)
+        exact_span = int(
+            _mention_start(mention) == _mention_start(candidate)
+            and _mention_end(mention) == _mention_end(candidate)
+        )
+        score = (overlap, exact_span)
+        if score > best_score:
+            best_score = score
+            best_index = candidate_index
+
+    return best_index
+
+
+def collect_mention_mismatches(
+    records: Iterable[Mapping[str, Any]],
+    predictions_by_chunk_id: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    mode: str = "relaxed",
+    require_label_match: bool = True,
+) -> pd.DataFrame:
+    """Collect mention-level mismatches for error analysis.
+
+    Duplicate predictions and gold mentions are removed using the same scoring
+    identity as ``evaluate_mention_lists`` before mismatch attribution.
+    """
+    rows = []
+
+    for record in records:
+        predictions = _deduplicate_mentions(
+            _valid_mentions(predictions_by_chunk_id.get(record["chunk_id"], [])),
+            require_label_match=require_label_match,
+        )
+        gold_mentions = _deduplicate_mentions(
+            _valid_mentions(record.get("mentions", [])),
+            require_label_match=require_label_match,
+        )
+
+        matched_prediction_indexes = set()
+        matched_gold_indexes = set()
+
+        for prediction_index, prediction in enumerate(predictions):
+            gold_index = _best_unmatched_mention(
+                prediction,
+                gold_mentions,
+                matched_gold_indexes,
+                mode=mode,
+                require_label_match=require_label_match,
+            )
+            if gold_index is None:
+                continue
+            matched_prediction_indexes.add(prediction_index)
+            matched_gold_indexes.add(gold_index)
+
+        if require_label_match:
+            for prediction_index, prediction in enumerate(predictions):
+                if prediction_index in matched_prediction_indexes:
+                    continue
+                gold_index = _best_unmatched_mention(
+                    prediction,
+                    gold_mentions,
+                    matched_gold_indexes,
+                    mode=mode,
+                    require_label_match=False,
+                )
+                if gold_index is None:
+                    continue
+                gold = gold_mentions[gold_index]
+                matched_prediction_indexes.add(prediction_index)
+                matched_gold_indexes.add(gold_index)
+                rows.append(
+                    _mention_mismatch_row(
+                        record,
+                        "LABEL_MISMATCH",
+                        prediction=prediction,
+                        gold=gold,
+                    )
+                )
+
+        for prediction_index, prediction in enumerate(predictions):
+            if prediction_index in matched_prediction_indexes:
+                continue
+            rows.append(
+                _mention_mismatch_row(
+                    record,
+                    "UNMATCHED_PREDICTION",
+                    prediction=prediction,
+                )
+            )
+
+        for gold_index, gold in enumerate(gold_mentions):
+            if gold_index in matched_gold_indexes:
+                continue
+            rows.append(
+                _mention_mismatch_row(
+                    record,
+                    "MISSING_GOLD",
+                    gold=gold,
+                )
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _mention_mismatch_row(
+    record: Mapping[str, Any],
+    mismatch_type: str,
+    *,
+    prediction: Optional[Mapping[str, Any]] = None,
+    gold: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    predicted_label = _mention_label(prediction) if prediction is not None else None
+    gold_label = _mention_label(gold) if gold is not None else None
+    if mismatch_type == "LABEL_MISMATCH":
+        label = f"{gold_label} -> {predicted_label}"
+    else:
+        label = predicted_label or gold_label
+
+    return {
+        "split": record.get("split"),
+        "dataset": record.get("dataset"),
+        "modality": record.get("modality"),
+        "chunk_id": record.get("chunk_id"),
+        "title": record.get("title"),
+        "mismatch_type": mismatch_type,
+        "label": label,
+        "gold_label": gold_label,
+        "predicted_label": predicted_label,
+        "gold_text": gold.get("text") if gold is not None else None,
+        "predicted_text": prediction.get("text") if prediction is not None else None,
+        "gold_start": _mention_start(gold) if gold is not None else None,
+        "gold_end": _mention_end(gold) if gold is not None else None,
+        "predicted_start": _mention_start(prediction) if prediction is not None else None,
+        "predicted_end": _mention_end(prediction) if prediction is not None else None,
+        "score": prediction.get("score") if prediction is not None else None,
+    }
+
+
+def summarize_mention_mismatches(
+    mismatch_df: pd.DataFrame,
+    *,
+    group_fields: Sequence[str] = ("mismatch_type", "label"),
+) -> pd.DataFrame:
+    """Summarize mismatch counts by type, label, or metadata fields."""
+    if mismatch_df.empty:
+        return pd.DataFrame([{"count": 0}])
+    return (
+        mismatch_df.groupby(list(group_fields), dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
 def filter_predictions_by_score(
