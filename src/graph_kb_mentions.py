@@ -221,15 +221,19 @@ def export_incremental_mention_tables(
     label_set_version: str,
     export_dir: str | Path = MENTION_EXPORT_DIR,
 ) -> Dict[str, Path]:
-    """Merge one completed extraction batch into the mention CSV exports.
+    """Append one completed extraction batch into the mention CSV exports.
 
     The progress CSV records every completed chunk, including chunks with zero
     mentions, so interrupted runs can resume without reprocessing them.
+
+    This function intentionally appends instead of re-reading and rewriting the
+    full export files on every batch. The extraction loop already skips chunks
+    present in the progress file, so appending avoids an O(total rows * batches)
+    CSV bottleneck during large archive runs.
     """
     export_path = Path(export_dir)
     export_path.mkdir(parents=True, exist_ok=True)
 
-    batch_chunk_ids = {str(_chunk_value(chunk, "chunk_id")) for chunk in chunks}
     batch_tables = build_mention_tables(
         chunks,
         predictions_by_chunk_id,
@@ -245,26 +249,15 @@ def export_incremental_mention_tables(
     }.items():
         csv_path = export_path / f"{table_name}.csv"
         batch_table = batch_tables[table_name]
+        write_header = not csv_path.exists()
 
-        if csv_path.exists():
-            existing_table = pd.read_csv(csv_path)
-            if chunk_column in existing_table.columns:
-                existing_table = existing_table[
-                    ~existing_table[chunk_column].astype(str).isin(batch_chunk_ids)
-                ]
-            combined_table = pd.concat(
-                [existing_table, batch_table],
-                ignore_index=True,
-                sort=False,
-            )
-        else:
-            combined_table = batch_table
-
-        exported_paths[table_name] = dataframe_to_csv(
-            combined_table,
+        batch_table.to_csv(
             csv_path,
-            json_columns=GRAPH_JSON_COLUMNS,
+            mode="a",
+            header=write_header,
+            index=False,
         )
+        exported_paths[table_name] = csv_path
 
     progress_path = export_path / MENTION_PROGRESS_FILENAME
     progress_rows = [
@@ -282,23 +275,11 @@ def export_incremental_mention_tables(
     ]
     batch_progress = pd.DataFrame(progress_rows)
 
-    if progress_path.exists():
-        existing_progress = pd.read_csv(progress_path)
-        if "chunk_id" in existing_progress.columns:
-            existing_progress = existing_progress[
-                ~existing_progress["chunk_id"].astype(str).isin(batch_chunk_ids)
-            ]
-        progress_table = pd.concat(
-            [existing_progress, batch_progress],
-            ignore_index=True,
-            sort=False,
-        )
-    else:
-        progress_table = batch_progress
-
-    exported_paths["mention_extraction_progress"] = dataframe_to_csv(
-        progress_table,
+    batch_progress.to_csv(
         progress_path,
-        json_columns=GRAPH_JSON_COLUMNS,
+        mode="a",
+        header=not progress_path.exists(),
+        index=False,
     )
+    exported_paths["mention_extraction_progress"] = progress_path
     return exported_paths
