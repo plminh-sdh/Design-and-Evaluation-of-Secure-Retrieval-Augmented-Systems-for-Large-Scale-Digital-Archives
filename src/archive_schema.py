@@ -126,6 +126,30 @@ def dataframe_to_csv(
     return path
 
 
+def append_dataframe_to_csv(
+    df: pd.DataFrame,
+    csv_path: str | Path,
+    json_columns: Optional[Sequence[str]] = None,
+    index: bool = False,
+) -> Path:
+    """Append a dataframe to CSV, writing the header only for new files."""
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    export_df = df.copy()
+    for column in json_columns or []:
+        if column in export_df.columns:
+            export_df[column] = export_df[column].map(json_serialize_cell)
+
+    export_df.to_csv(
+        path,
+        mode="a",
+        header=not path.exists(),
+        index=index,
+    )
+    return path
+
+
 def csv_to_dataframe(
     csv_path: str | Path,
     json_columns: Optional[Sequence[str]] = None,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -93,6 +94,20 @@ def patch_refined_for_py312_windows() -> Dict[str, str]:
         status["refined_fine_tune_dataloader"] = "patched_num_workers_0"
     except Exception as exc:  # pragma: no cover - depends on optional package.
         status["refined_fine_tune_dataloader"] = f"not_patched: {exc}"
+
+    try:
+        import torch
+        import refined.inference.processor as refined_processor
+
+        def refined_inference_autocast(*args: Any, **kwargs: Any) -> Any:
+            if torch.cuda.is_available():
+                return torch.amp.autocast("cuda", *args, **kwargs)
+            return nullcontext()
+
+        refined_processor.autocast = refined_inference_autocast
+        status["refined_inference_autocast"] = "patched"
+    except Exception as exc:  # pragma: no cover - depends on optional package.
+        status["refined_inference_autocast"] = f"not_patched: {exc}"
 
     return status
 

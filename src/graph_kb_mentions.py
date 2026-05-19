@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import pandas as pd
 
-from src.archive_schema import ArchiveChunk, dataframe_to_csv, stable_id
+from src.archive_schema import ArchiveChunk, append_dataframe_to_csv, dataframe_to_csv, stable_id
 from src.graph_kb_skeleton import GRAPH_JSON_COLUMNS
 
 
@@ -249,15 +249,7 @@ def export_incremental_mention_tables(
     }.items():
         csv_path = export_path / f"{table_name}.csv"
         batch_table = batch_tables[table_name]
-        write_header = not csv_path.exists()
-
-        batch_table.to_csv(
-            csv_path,
-            mode="a",
-            header=write_header,
-            index=False,
-        )
-        exported_paths[table_name] = csv_path
+        exported_paths[table_name] = append_dataframe_to_csv(batch_table, csv_path)
 
     progress_path = export_path / MENTION_PROGRESS_FILENAME
     progress_rows = [
@@ -275,11 +267,8 @@ def export_incremental_mention_tables(
     ]
     batch_progress = pd.DataFrame(progress_rows)
 
-    batch_progress.to_csv(
+    exported_paths["mention_extraction_progress"] = append_dataframe_to_csv(
+        batch_progress,
         progress_path,
-        mode="a",
-        header=not progress_path.exists(),
-        index=False,
     )
-    exported_paths["mention_extraction_progress"] = progress_path
     return exported_paths
