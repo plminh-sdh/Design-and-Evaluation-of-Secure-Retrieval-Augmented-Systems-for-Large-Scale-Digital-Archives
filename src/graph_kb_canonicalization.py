@@ -61,9 +61,6 @@ MENTION_CANONICALIZATION_COLUMNS = [
 ]
 CANONICALIZATION_PROGRESS_COLUMNS = [
     "mention_id",
-    "canonicalizer",
-    "model_name",
-    "model_version",
 ]
 
 
@@ -188,21 +185,25 @@ def load_completed_canonicalization_mention_ids(
     canonicalizer: str | None = None,
     model_name: str | None = None,
     model_version: str | None = None,
+    chunksize: int = 250_000,
 ) -> set[str]:
     """Load mention IDs already checkpointed by incremental canonicalization."""
     progress_path = Path(export_dir) / CANONICALIZATION_PROGRESS_FILENAME
     if not progress_path.exists():
         return set()
 
-    progress_df = pd.read_csv(progress_path, dtype={"mention_id": "string"})
-    for column, expected_value in {
-        "canonicalizer": canonicalizer,
-        "model_name": model_name,
-        "model_version": model_version,
-    }.items():
-        if expected_value is not None and column in progress_df.columns:
-            progress_df = progress_df[progress_df[column] == expected_value]
-    return set(progress_df["mention_id"].dropna().astype(str))
+    completed_mention_ids: set[str] = set()
+
+    progress_reader = pd.read_csv(
+        progress_path,
+        usecols=["mention_id"],
+        dtype={"mention_id": "string"},
+        chunksize=chunksize,
+    )
+    for progress_df in progress_reader:
+        completed_mention_ids.update(progress_df["mention_id"].dropna().astype(str))
+
+    return completed_mention_ids
 
 
 def load_existing_entity_ids(export_dir: str | Path = CANONICALIZATION_EXPORT_DIR) -> set[str]:
@@ -223,7 +224,7 @@ def load_canonicalization_export_tables(
         table_name: pd.read_csv(export_path / f"{table_name}.csv")
         if (export_path / f"{table_name}.csv").exists()
         else pd.DataFrame()
-        for table_name in ["entities", "mention_refers_to_entity", "mention_canonicalization"]
+        for table_name in ["entities", "mention_refers_to_entity"]
     }
 
 
@@ -378,9 +379,6 @@ def export_incremental_canonicalization_tables(
     progress_rows = [
         {
             "mention_id": row["mention_id"],
-            "canonicalizer": canonicalizer,
-            "model_name": model_name,
-            "model_version": model_version,
         }
         for row in mention_rows
     ]
@@ -596,9 +594,6 @@ def run_refined_canonicalization_export(
                     progress_rows = [
                         {
                             "mention_id": row["mention_id"],
-                            "canonicalizer": canonicalizer,
-                            "model_name": model_name,
-                            "model_version": model_version,
                         }
                         for row in mention_rows
                     ]
@@ -636,9 +631,6 @@ def run_refined_canonicalization_export(
                             [
                                 {
                                     "mention_id": row["mention_id"],
-                                    "canonicalizer": canonicalizer,
-                                    "model_name": model_name,
-                                    "model_version": model_version,
                                 }
                                 for row in mention_rows
                             ],
