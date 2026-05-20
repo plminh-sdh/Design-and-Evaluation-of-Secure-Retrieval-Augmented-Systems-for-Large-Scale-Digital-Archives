@@ -130,3 +130,53 @@ def plot_mismatch_summary(
     axis.set_xlabel("Count")
     plt.tight_layout()
     return fig
+
+
+def plot_local_coreference_threshold_metrics(
+    results_df: pd.DataFrame,
+    *,
+    threshold_column: str = "threshold",
+    metrics: Sequence[str] = (
+        "pairwise_precision",
+        "pairwise_recall",
+        "pairwise_f1",
+        "purity",
+        "inverse_purity",
+        "clustered_mention_coverage",
+    ),
+    precision_floor: float | None = 0.90,
+    title: str = "Local Coreference Threshold Tuning",
+    figsize: tuple[int, int] = (12, 6),
+):
+    """Plot local coreference quality and coverage over similarity thresholds."""
+    import matplotlib.pyplot as plt
+
+    plot_df = results_df.sort_values(threshold_column)
+    fig, axis = plt.subplots(figsize=figsize)
+    for metric in metrics:
+        if metric in plot_df.columns:
+            axis.plot(
+                plot_df[threshold_column],
+                plot_df[metric],
+                marker="o",
+                label=metric,
+            )
+
+    if precision_floor is not None:
+        axis.axhline(
+            precision_floor,
+            color="#AA4444",
+            linestyle="--",
+            linewidth=1,
+            label=f"precision floor {precision_floor:.2f}",
+        )
+
+    axis.set_title(title)
+    axis.set_xlabel("Cosine similarity threshold")
+    axis.set_ylabel("Score")
+    axis.set_ylim(0, 1)
+    axis.grid(True, alpha=0.3)
+    axis.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    return fig
+
