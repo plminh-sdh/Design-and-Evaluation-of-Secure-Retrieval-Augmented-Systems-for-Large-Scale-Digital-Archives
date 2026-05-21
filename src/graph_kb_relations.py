@@ -28,6 +28,8 @@ from src.graph_kb_local_coreference import (
 
 RELATION_EXPORT_DIR = Path("data") / "graph_kb_exports" / "step_04_relations"
 DEFAULT_RELATION_TEXT_COLUMN = "masked_text"
+TYPED_RELATIONS_FILENAME = "typed_relations.csv"
+TYPED_RELATION_PROGRESS_FILENAME = "typed_relation_progress.csv"
 DEFAULT_RELATION_CANDIDATE_TYPES = {
     "PERSON",
     "ORGANIZATION",
@@ -277,6 +279,21 @@ RELATION_PREDICTION_COLUMNS = [
     "model_version",
     ":TYPE",
 ]
+
+LIGHTWEIGHT_RELATION_EXPORT_COLUMNS = [
+    "relation_id:ID(Relation)",
+    ":START_ID(Entity)",
+    ":END_ID(Entity)",
+    "relation_type",
+    "glirel_label",
+    "input_id",
+    "chunk_id",
+    "document_id",
+    "dataset",
+    "modality",
+]
+
+RELATION_PROGRESS_COLUMNS = ["chunk_id"]
 
 RELATION_GOLD_RAW_PREDICTION_COLUMNS = [
     "sample_id",
@@ -851,6 +868,264 @@ def iter_chunk_id_batches(
                 buffer = []
     if buffer:
         yield buffer
+
+
+def load_completed_relation_chunk_ids(
+    progress_csv: str | Path,
+) -> set[str]:
+    """Load lightweight typed-relation extraction progress chunk IDs."""
+    path = Path(progress_csv)
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    progress = pd.read_csv(path, usecols=lambda column: column == "chunk_id")
+    if "chunk_id" not in progress.columns:
+        return set()
+    return set(progress["chunk_id"].dropna().astype(str))
+
+
+def append_relation_progress(
+    chunk_ids: Iterable[str],
+    progress_csv: str | Path,
+) -> Path:
+    """Append completed chunk IDs to the lightweight relation progress file."""
+    path = Path(progress_csv)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ids = [str(chunk_id) for chunk_id in chunk_ids if str(chunk_id)]
+    if not ids:
+        return path
+    progress_df = pd.DataFrame({"chunk_id": ids}).drop_duplicates("chunk_id")
+    progress_df.to_csv(
+        path,
+        mode="a",
+        header=not path.exists(),
+        index=False,
+    )
+    return path
+
+
+def append_relation_predictions_csv(
+    predictions_df: pd.DataFrame,
+    output_csv: str | Path,
+) -> Path:
+    """Append lightweight typed relation edge rows to CSV."""
+    path = Path(output_csv)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if predictions_df.empty:
+        return path
+    export_df = predictions_df.copy()
+    for column in LIGHTWEIGHT_RELATION_EXPORT_COLUMNS:
+        if column not in export_df.columns:
+            export_df[column] = pd.NA
+    export_df = export_df[LIGHTWEIGHT_RELATION_EXPORT_COLUMNS]
+    export_df.to_csv(
+        path,
+        mode="a",
+        header=not path.exists(),
+        index=False,
+    )
+    return path
+
+
+def _count_chunk_rows(
+    chunks_csv: str | Path,
+    *,
+    chunksize: int = 250_000,
+) -> int:
+    total = 0
+    for chunk in pd.read_csv(
+        chunks_csv,
+        usecols=lambda column: column in {"chunk_id:ID(Chunk)", "chunk_id"},
+        chunksize=chunksize,
+        low_memory=False,
+    ):
+        total += len(chunk)
+    return int(total)
+
+
+def run_typed_relation_extraction_export(
+    chunks_csv: str | Path,
+    refined_canonicalization_csv: str | Path,
+    local_coreference_predictions_csv: str | Path,
+    mentions_csv: str | Path,
+    model: Any,
+    nlp: Any,
+    *,
+    export_dir: str | Path = RELATION_EXPORT_DIR,
+    output_csv: str | Path | None = None,
+    progress_csv: str | Path | None = None,
+    batch_size_chunks: int = 500,
+    glirel_batch_size: int = 8,
+    relation_threshold: float = 0.15,
+    top_k: int = 3,
+    text_column: str = DEFAULT_RELATION_TEXT_COLUMN,
+    allowed_types: Iterable[str] = DEFAULT_RELATION_CANDIDATE_TYPES,
+    include_local_singletons: bool = False,
+    exclude_generic: bool = True,
+    max_pair_token_distance: int = 96,
+    window_token_radius: int = 64,
+    max_pairs_per_chunk: int = 8,
+    max_entities_per_window: int = 8,
+    csv_chunksize: int = 250_000,
+    max_chunks: Optional[int] = None,
+    resume: bool = True,
+    verbose: bool = True,
+    extractor: str = "GLiREL",
+    model_name: str = "jackboyla/glirel-large-v0",
+    model_version: str = "",
+) -> Dict[str, Any]:
+    """Run resumable typed relation extraction over chunk batches.
+
+    For each chunk batch, this function loads chunk text and canonicalized
+    mentions, builds constrained GLiREL pair-window inputs, predicts relations,
+    validates schema-compatible edges, appends Neo4j-ready relationship rows,
+    and appends processed chunk IDs to a lightweight progress file.
+    """
+    export_path = Path(export_dir)
+    export_path.mkdir(parents=True, exist_ok=True)
+    output_path = Path(output_csv) if output_csv is not None else export_path / TYPED_RELATIONS_FILENAME
+    progress_path = Path(progress_csv) if progress_csv is not None else export_path / TYPED_RELATION_PROGRESS_FILENAME
+
+    completed_ids = load_completed_relation_chunk_ids(progress_path) if resume else set()
+    completed_before = len(completed_ids)
+    total_chunks = _count_chunk_rows(chunks_csv, chunksize=csv_chunksize)
+    if max_chunks is not None:
+        total_chunks = min(total_chunks, int(max_chunks))
+    total_batches = (total_chunks + batch_size_chunks - 1) // batch_size_chunks
+
+    processed_chunks = 0
+    skipped_completed = 0
+    batches_seen = 0
+    batches_processed = 0
+    glirel_inputs_total = 0
+    raw_predictions_total = 0
+    exported_relations_total = 0
+    chunks_iterated = 0
+
+    batch_iter = iter_chunk_id_batches(
+        chunks_csv,
+        batch_size=batch_size_chunks,
+        chunksize=csv_chunksize,
+    )
+    progress_bar = tqdm(
+        batch_iter,
+        total=total_batches,
+        desc="Typed relation extraction batches",
+        unit="batch",
+        disable=not verbose,
+    )
+
+    for chunk_id_batch in progress_bar:
+        if max_chunks is not None and chunks_iterated >= max_chunks:
+            break
+        if max_chunks is not None and chunks_iterated + len(chunk_id_batch) > max_chunks:
+            chunk_id_batch = chunk_id_batch[: max_chunks - chunks_iterated]
+        chunks_iterated += len(chunk_id_batch)
+        batches_seen += 1
+
+        pending_chunk_ids = [
+            str(chunk_id)
+            for chunk_id in chunk_id_batch
+            if not resume or str(chunk_id) not in completed_ids
+        ]
+        skipped_completed += len(chunk_id_batch) - len(pending_chunk_ids)
+        if not pending_chunk_ids:
+            if verbose:
+                progress_bar.set_postfix(
+                    exported=exported_relations_total,
+                    skipped=skipped_completed,
+                )
+            continue
+
+        if verbose:
+            tqdm.write(
+                "Typed relation batch "
+                f"{batches_seen:,}: loading {len(pending_chunk_ids):,} chunks "
+                f"({len(completed_ids):,} already completed)"
+            )
+
+        chunks_df, mentions_df = load_relation_extraction_batch(
+            chunks_csv,
+            refined_canonicalization_csv,
+            local_coreference_predictions_csv,
+            mentions_csv,
+            chunk_ids=pending_chunk_ids,
+            text_column=text_column,
+            allowed_types=allowed_types,
+            include_local_singletons=include_local_singletons,
+            exclude_generic=exclude_generic,
+            chunksize=csv_chunksize,
+            verbose=verbose,
+        )
+
+        glirel_inputs = build_glirel_pair_window_inputs(
+            chunks_df,
+            mentions_df,
+            nlp,
+            max_pair_token_distance=max_pair_token_distance,
+            window_token_radius=window_token_radius,
+            max_pairs_per_chunk=max_pairs_per_chunk,
+            max_entities_per_window=max_entities_per_window,
+            max_windows=None,
+            verbose=verbose,
+        )
+        glirel_inputs_total += len(glirel_inputs)
+
+        raw_predictions = predict_glirel_relations_for_batch(
+            model,
+            glirel_inputs,
+            threshold=relation_threshold,
+            top_k=top_k,
+            verbose=verbose,
+            batch_size=glirel_batch_size,
+        )
+        raw_predictions_total += len(raw_predictions)
+
+        predictions_df = validate_and_normalize_relation_predictions(
+            raw_predictions,
+            glirel_inputs,
+            extractor=extractor,
+            model_name=model_name,
+            model_version=model_version,
+        )
+        append_relation_predictions_csv(predictions_df, output_path)
+        append_relation_progress(pending_chunk_ids, progress_path)
+
+        completed_ids.update(pending_chunk_ids)
+        batches_processed += 1
+        processed_chunks += len(pending_chunk_ids)
+        exported_relations_total += len(predictions_df)
+
+        if verbose:
+            tqdm.write(
+                "Typed relation batch complete: "
+                f"{len(glirel_inputs):,} GLiREL inputs, "
+                f"{len(raw_predictions):,} raw predictions, "
+                f"{len(predictions_df):,} exported relation rows"
+            )
+            progress_bar.set_postfix(
+                chunks=processed_chunks,
+                inputs=glirel_inputs_total,
+                exported=exported_relations_total,
+                skipped=skipped_completed,
+            )
+
+    return {
+        "output_csv": output_path,
+        "progress_csv": progress_path,
+        "resume": bool(resume),
+        "completed_before": int(completed_before),
+        "processed_chunks": int(processed_chunks),
+        "skipped_completed_chunks": int(skipped_completed),
+        "batches_seen": int(batches_seen),
+        "batches_processed": int(batches_processed),
+        "glirel_inputs": int(glirel_inputs_total),
+        "raw_predictions": int(raw_predictions_total),
+        "exported_relation_rows": int(exported_relations_total),
+        "relation_threshold": float(relation_threshold),
+        "glirel_batch_size": int(glirel_batch_size),
+        "batch_size_chunks": int(batch_size_chunks),
+        "max_chunks": max_chunks,
+    }
 
 
 def _empty_chunk_stats_dataframe() -> pd.DataFrame:
