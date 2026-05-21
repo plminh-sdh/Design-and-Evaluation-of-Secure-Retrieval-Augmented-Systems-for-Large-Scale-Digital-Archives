@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from bisect import bisect_left, bisect_right
+from collections import Counter, defaultdict
 import json
 from pathlib import Path
 import random
@@ -193,6 +194,9 @@ RELATION_BY_GLIREL_LABEL = {
     entry.glirel_label: entry.graph_relation for entry in RELATION_SCHEMA
 }
 RELATION_BY_GRAPH_TYPE = {entry.graph_relation: entry for entry in RELATION_SCHEMA}
+RELATION_GLIREL_LABEL_BY_GRAPH_TYPE = {
+    entry.graph_relation: entry.glirel_label for entry in RELATION_SCHEMA
+}
 ALLOWED_DIRECTED_TYPE_PAIRS = {
     (head_type, tail_type)
     for entry in RELATION_SCHEMA
@@ -256,6 +260,7 @@ RELATION_PREDICTION_COLUMNS = [
     "relation_type",
     "glirel_label",
     "confidence:float",
+    "input_id",
     "chunk_id",
     "document_id",
     "dataset",
@@ -276,6 +281,7 @@ RELATION_PREDICTION_COLUMNS = [
 RELATION_GOLD_RAW_PREDICTION_COLUMNS = [
     "sample_id",
     "split",
+    "input_id",
     "chunk_id",
     "document_id",
     "dataset",
@@ -1313,6 +1319,252 @@ def build_glirel_batch_inputs(
     return inputs
 
 
+def _token_gap(left: Mapping[str, Any], right: Mapping[str, Any]) -> int:
+    """Return the number of tokens between two mention spans."""
+    if int(left["token_end"]) < int(right["token_start"]):
+        return int(right["token_start"]) - int(left["token_end"]) - 1
+    if int(right["token_end"]) < int(left["token_start"]):
+        return int(left["token_start"]) - int(right["token_end"]) - 1
+    return 0
+
+
+def _align_mentions_for_relation_chunk(
+    mentions: pd.DataFrame,
+    doc: Any,
+    *,
+    dedupe_entity_spans: bool = True,
+) -> list[Dict[str, Any]]:
+    token_starts = [int(token.idx) for token in doc]
+    token_ends = [int(token.idx) + len(token.text) for token in doc]
+    seen_entity_spans: set[tuple[str, int, int]] = set()
+    mention_records: list[Dict[str, Any]] = []
+    for row in mentions.itertuples(index=False):
+        token_span = align_char_span_to_token_span_fast(
+            token_starts,
+            token_ends,
+            int(getattr(row, "start_char")),
+            int(getattr(row, "end_char")),
+        )
+        if token_span is None:
+            continue
+        start_token, end_token = token_span
+        entity_id = str(getattr(row, "entity_id"))
+        dedupe_key = (entity_id, start_token, end_token)
+        if dedupe_entity_spans and dedupe_key in seen_entity_spans:
+            continue
+        seen_entity_spans.add(dedupe_key)
+        record = row._asdict()
+        record["mention_type"] = str(record.get("mention_type") or "").upper()
+        record["token_start"] = start_token
+        record["token_end"] = end_token
+        mention_records.append(record)
+    return mention_records
+
+
+def build_glirel_pair_window_inputs(
+    chunks_df: pd.DataFrame,
+    mentions_df: pd.DataFrame,
+    nlp: Any,
+    *,
+    max_pair_token_distance: int = 96,
+    window_token_radius: int = 64,
+    max_pairs_per_chunk: int = 80,
+    max_entities_per_window: int = 8,
+    max_windows: Optional[int] = None,
+    verbose: bool = True,
+) -> list[Dict[str, Any]]:
+    """Build small pair-window GLiREL inputs for scalable relation extraction.
+
+    Each output contains only one directed candidate pair, only the relation
+    labels allowed by that pair's entity types, and a cropped token window around
+    the two mentions. This avoids the quadratic all-entities-in-full-chunk
+    payload used by the diagnostic/gold-sampling chunk builder.
+    """
+    inputs: list[Dict[str, Any]] = []
+    if chunks_df.empty or mentions_df.empty:
+        return inputs
+
+    sorted_mentions = mentions_df.sort_values(
+        ["chunk_id", "start_char", "end_char", "mention_id"],
+        kind="mergesort",
+    )
+    mention_groups = {
+        str(chunk_id): group
+        for chunk_id, group in sorted_mentions.groupby("chunk_id", sort=False)
+    }
+    skipped_no_mentions = 0
+    skipped_no_aligned_mentions = 0
+    skipped_no_near_pairs = 0
+    candidate_pairs_seen = 0
+
+    for row in tqdm(
+        chunks_df.to_dict("records"),
+        desc="Building GLiREL pair-window inputs",
+        unit="chunk",
+        disable=not verbose,
+    ):
+        if max_windows is not None and len(inputs) >= max_windows:
+            break
+        chunk_id = str(row.get("chunk_id") or "")
+        text = str(row.get("chunk_text") or "")
+        chunk_mentions = mention_groups.get(chunk_id)
+        if not text or chunk_mentions is None or chunk_mentions.empty:
+            skipped_no_mentions += 1
+            continue
+
+        doc = nlp.make_doc(text) if hasattr(nlp, "make_doc") else nlp(text)
+        tokens = [token.text for token in doc]
+        mention_records = _align_mentions_for_relation_chunk(chunk_mentions, doc)
+        if len(mention_records) < 2:
+            skipped_no_aligned_mentions += 1
+            continue
+
+        candidate_pairs: list[tuple[int, Dict[str, Any], Dict[str, Any], list[str]]] = []
+        for head in mention_records:
+            head_type = str(head.get("mention_type") or "").upper()
+            head_entity_id = str(head.get("entity_id"))
+            for tail in mention_records:
+                if head is tail or head_entity_id == str(tail.get("entity_id")):
+                    continue
+                tail_type = str(tail.get("mention_type") or "").upper()
+                relation_types = relation_labels_for_type_pair(head_type, tail_type)
+                if not relation_types:
+                    continue
+                gap = _token_gap(head, tail)
+                if gap > max_pair_token_distance:
+                    continue
+                labels = [
+                    RELATION_GLIREL_LABEL_BY_GRAPH_TYPE[relation_type]
+                    for relation_type in relation_types
+                    if relation_type in RELATION_GLIREL_LABEL_BY_GRAPH_TYPE
+                ]
+                if not labels:
+                    continue
+                candidate_pairs.append((gap, head, tail, labels))
+
+        if not candidate_pairs:
+            skipped_no_near_pairs += 1
+            continue
+        candidate_pairs.sort(
+            key=lambda item: (
+                item[0],
+                int(item[1]["token_start"]),
+                int(item[2]["token_start"]),
+            )
+        )
+        candidate_pairs = candidate_pairs[:max_pairs_per_chunk]
+        candidate_pairs_seen += len(candidate_pairs)
+
+        windows: list[Dict[str, Any]] = []
+        for gap, head, tail, labels in candidate_pairs:
+            pair_start = min(int(head["token_start"]), int(tail["token_start"]))
+            pair_end = max(int(head["token_end"]), int(tail["token_end"]))
+            window_start = max(0, pair_start - window_token_radius)
+            window_end = min(len(tokens) - 1, pair_end + window_token_radius)
+
+            assigned = False
+            for window in windows:
+                # Bundle pairs whose desired windows overlap heavily. This
+                # amortizes GLiREL's fixed per-call overhead without going back
+                # to full dense chunks.
+                if window_start <= window["end"] and window_end >= window["start"]:
+                    existing_keys = {
+                        str(record.get("mention_id"))
+                        for record in window["mentions"]
+                    }
+                    new_mentions = [
+                        record
+                        for record in (head, tail)
+                        if str(record.get("mention_id")) not in existing_keys
+                    ]
+                    if len(window["mentions"]) + len(new_mentions) <= max_entities_per_window:
+                        window["start"] = min(window["start"], window_start)
+                        window["end"] = max(window["end"], window_end)
+                        window["labels"].update(labels)
+                        window["pair_gaps"].append(gap)
+                        window["pair_count"] += 1
+                        window["mentions"].extend(dict(record) for record in new_mentions)
+                        assigned = True
+                        break
+            if not assigned:
+                windows.append(
+                    {
+                        "start": window_start,
+                        "end": window_end,
+                        "labels": set(labels),
+                        "pair_gaps": [gap],
+                        "pair_count": 1,
+                        "mentions": [dict(head), dict(tail)],
+                    }
+                )
+
+        for window in windows:
+            if max_windows is not None and len(inputs) >= max_windows:
+                break
+            window_start = int(window["start"])
+            window_end = int(window["end"])
+            window_tokens = tokens[window_start : window_end + 1]
+            if not window_tokens:
+                continue
+
+            mention_records: list[Dict[str, Any]] = []
+            ner: list[list[Any]] = []
+            for record in sorted(
+                window["mentions"],
+                key=lambda item: (int(item["token_start"]), int(item["token_end"])),
+            ):
+                adjusted_record = dict(record)
+                adjusted_record["token_start"] = int(adjusted_record["token_start"]) - window_start
+                adjusted_record["token_end"] = int(adjusted_record["token_end"]) - window_start
+                adjusted_record["ner_index"] = len(ner)
+                mention_records.append(adjusted_record)
+                ner.append(
+                    [
+                        int(adjusted_record["token_start"]),
+                        int(adjusted_record["token_end"]),
+                        str(adjusted_record.get("mention_type") or "").upper(),
+                        str(adjusted_record.get("mention_text") or ""),
+                    ]
+                )
+            input_id = stable_id(
+                "relation_pair_bundle_window",
+                chunk_id,
+                ",".join(str(record.get("mention_id")) for record in mention_records),
+                ",".join(sorted(window["labels"])),
+                window_start,
+                window_end,
+            )
+            inputs.append(
+                {
+                    "input_id": input_id,
+                    "chunk_id": chunk_id,
+                    "document_id": row.get("document_id"),
+                    "dataset": row.get("dataset"),
+                    "modality": row.get("modality"),
+                    "text": " ".join(window_tokens),
+                    "source_text": text,
+                    "window_start_token": window_start,
+                    "window_end_token": window_end,
+                    "pair_token_gap": min(window["pair_gaps"]) if window["pair_gaps"] else None,
+                    "candidate_pair_count": int(window["pair_count"]),
+                    "tokens": window_tokens,
+                    "ner": ner,
+                    "mention_records": mention_records,
+                    "labels": sorted(window["labels"]),
+                }
+            )
+
+    if verbose:
+        tqdm.write(
+            "Built GLiREL pair-window inputs: "
+            f"{len(inputs):,} windows from {candidate_pairs_seen:,} candidate pairs; "
+            f"{skipped_no_mentions:,} chunks without mentions/text, "
+            f"{skipped_no_aligned_mentions:,} without aligned mentions, "
+            f"{skipped_no_near_pairs:,} without nearby schema-valid pairs"
+        )
+    return inputs
+
+
 def _chunk_has_allowed_relation_pair(mention_records: Sequence[Mapping[str, Any]]) -> bool:
     for head in mention_records:
         head_type = str(head.get("mention_type") or "").upper()
@@ -1335,9 +1587,14 @@ def predict_glirel_relations_for_input(
     top_k: int = 1,
 ) -> list[Dict[str, Any]]:
     """Run a GLiREL direct-call prediction for one prepared chunk input."""
+    labels = glirel_input.get("labels")
+    if isinstance(labels, Mapping):
+        labels = list(labels.get("glirel_labels", labels).keys())
+    elif not labels:
+        labels = glirel_label_list()
     return model.predict_relations(
         glirel_input["tokens"],
-        glirel_label_list(),
+        list(labels),
         threshold=threshold,
         ner=glirel_input["ner"],
         top_k=top_k,
@@ -1377,6 +1634,7 @@ def predict_glirel_relations_for_batch(
                 top_k=top_k,
             ):
                 enriched = dict(prediction)
+                enriched["input_id"] = item.get("input_id")
                 enriched["chunk_id"] = item.get("chunk_id")
                 enriched["document_id"] = item.get("document_id")
                 enriched["dataset"] = item.get("dataset")
@@ -1384,16 +1642,49 @@ def predict_glirel_relations_for_batch(
                 predictions.append(enriched)
         return predictions
 
-    for start in tqdm(
-        range(0, len(glirel_inputs), batch_size),
+    grouped_inputs: dict[tuple[str, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for item in glirel_inputs:
+        labels = item.get("labels")
+        if isinstance(labels, Mapping):
+            label_values = tuple(labels.get("glirel_labels", labels).keys())
+        elif labels:
+            label_values = tuple(str(label) for label in labels)
+        else:
+            label_values = tuple(glirel_label_list())
+        grouped_inputs[tuple(sorted(label_values))].append(item)
+
+    batch_specs: list[tuple[tuple[str, ...], list[Mapping[str, Any]]]] = []
+    for label_values, items in grouped_inputs.items():
+        sorted_items = sorted(
+            items,
+            key=lambda item: (len(item.get("tokens") or []), len(item.get("ner") or [])),
+        )
+        for start in range(0, len(sorted_items), batch_size):
+            batch_specs.append((label_values, sorted_items[start : start + batch_size]))
+    batch_specs.sort(
+        key=lambda spec: (
+            max(len(item.get("tokens") or []) for item in spec[1]),
+            max(len(item.get("ner") or []) for item in spec[1]),
+            len(spec[0]),
+        )
+    )
+
+    if verbose:
+        tqdm.write(
+            "Running GLiREL batched prediction with "
+            f"{len(grouped_inputs):,} label groups and {len(batch_specs):,} batches "
+            f"(batch_size={batch_size})"
+        )
+
+    for label_values, batch_items in tqdm(
+        batch_specs,
         desc="Running GLiREL relation prediction",
         unit="batch",
         disable=not verbose,
     ):
-        batch_items = list(glirel_inputs[start : start + batch_size])
         batch_outputs = model.batch_predict_relations(
             [item["tokens"] for item in batch_items],
-            glirel_label_list(),
+            list(label_values),
             threshold=threshold,
             ner=[item["ner"] for item in batch_items],
             top_k=top_k,
@@ -1403,12 +1694,13 @@ def predict_glirel_relations_for_batch(
                 glirel_label = str(prediction.get("label") or "")
                 if glirel_label not in RELATION_BY_GLIREL_LABEL:
                     continue
-            enriched = dict(prediction)
-            enriched["chunk_id"] = item.get("chunk_id")
-            enriched["document_id"] = item.get("document_id")
-            enriched["dataset"] = item.get("dataset")
-            enriched["modality"] = item.get("modality")
-            predictions.append(enriched)
+                enriched = dict(prediction)
+                enriched["input_id"] = item.get("input_id")
+                enriched["chunk_id"] = item.get("chunk_id")
+                enriched["document_id"] = item.get("document_id")
+                enriched["dataset"] = item.get("dataset")
+                enriched["modality"] = item.get("modality")
+                predictions.append(enriched)
     return predictions
 
 
@@ -1421,11 +1713,21 @@ def validate_and_normalize_relation_predictions(
     model_version: str = "",
 ) -> pd.DataFrame:
     """Validate raw GLiREL predictions against schema and return graph edges."""
-    input_by_chunk = {str(item["chunk_id"]): item for item in glirel_inputs}
+    input_by_id = {
+        str(item.get("input_id")): item
+        for item in glirel_inputs
+        if item.get("input_id")
+    }
+    input_by_chunk: dict[str, Mapping[str, Any]] = {}
+    for item in glirel_inputs:
+        input_by_chunk.setdefault(str(item["chunk_id"]), item)
     rows: list[Dict[str, Any]] = []
     for prediction in raw_predictions:
         chunk_id = str(prediction.get("chunk_id") or "")
-        item = input_by_chunk.get(chunk_id)
+        input_id = str(prediction.get("input_id") or "")
+        item = input_by_id.get(input_id) if input_id else None
+        if item is None:
+            item = input_by_chunk.get(chunk_id)
         if item is None:
             continue
         head = _find_prediction_endpoint(prediction, item, "head")
@@ -1447,6 +1749,7 @@ def validate_and_normalize_relation_predictions(
         score = float(prediction.get("score") or 0.0)
         relation_id = stable_id(
             "relation",
+            input_id,
             chunk_id,
             head.get("entity_id"),
             graph_relation,
@@ -1463,6 +1766,7 @@ def validate_and_normalize_relation_predictions(
                 "glirel_label": glirel_label,
                 "confidence:float": score,
                 "chunk_id": chunk_id,
+                "input_id": input_id,
                 "document_id": item.get("document_id"),
                 "dataset": item.get("dataset"),
                 "modality": item.get("modality"),
@@ -1494,7 +1798,14 @@ def raw_glirel_predictions_to_gold_records(
     verbose: bool = True,
 ) -> list[Dict[str, Any]]:
     """Convert raw GLiREL predictions to annotation-ready gold JSONL records."""
-    input_by_chunk = {str(item["chunk_id"]): item for item in glirel_inputs}
+    input_by_id = {
+        str(item.get("input_id")): item
+        for item in glirel_inputs
+        if item.get("input_id")
+    }
+    input_by_chunk: dict[str, Mapping[str, Any]] = {}
+    for item in glirel_inputs:
+        input_by_chunk.setdefault(str(item["chunk_id"]), item)
     records: list[Dict[str, Any]] = []
     seen: set[str] = set()
     for prediction in tqdm(
@@ -1504,7 +1815,10 @@ def raw_glirel_predictions_to_gold_records(
         disable=not verbose,
     ):
         chunk_id = str(prediction.get("chunk_id") or "")
-        item = input_by_chunk.get(chunk_id)
+        input_id = str(prediction.get("input_id") or "")
+        item = input_by_id.get(input_id) if input_id else None
+        if item is None:
+            item = input_by_chunk.get(chunk_id)
         if item is None:
             continue
         head = _find_prediction_endpoint(prediction, item, "head")
@@ -1540,6 +1854,7 @@ def raw_glirel_predictions_to_gold_records(
         sample_id = stable_id(
             "relation_gold_raw",
             split,
+            input_id,
             chunk_id,
             head.get("mention_id"),
             tail.get("mention_id"),
@@ -1552,6 +1867,7 @@ def raw_glirel_predictions_to_gold_records(
             {
                 "sample_id": sample_id,
                 "split": split,
+                "input_id": input_id,
                 "chunk_id": chunk_id,
                 "document_id": item.get("document_id"),
                 "dataset": item.get("dataset"),
@@ -1600,6 +1916,9 @@ def sample_relation_gold_prediction_records(
     if not records:
         return []
     df = pd.DataFrame([dict(record) for record in records])
+    for column in RELATION_GOLD_RAW_PREDICTION_COLUMNS:
+        if column not in df.columns:
+            df[column] = "" if column not in {"allowed_relation_types"} else [[] for _ in range(len(df))]
     if len(df) <= target_records:
         if verbose:
             tqdm.write(
@@ -1695,6 +2014,144 @@ def build_relation_gold_chunk_records(
     return records
 
 
+def build_relation_gold_annotation_chunk_records(
+    sampled_chunks_df: pd.DataFrame,
+    chunks_df: pd.DataFrame,
+    glirel_inputs: Sequence[Mapping[str, Any]],
+    raw_prediction_records: Sequence[Mapping[str, Any]],
+    *,
+    split: str,
+) -> list[Dict[str, Any]]:
+    """Build chunk-centered, model-assisted relation gold annotation records.
+
+    The exported records use the selected chunk as the annotation unit. GLiREL
+    predictions are grouped into ``model_predictions`` and copied into
+    ``gold_relations`` as a draft that can be manually corrected by deleting
+    false positives, changing labels/directions, and adding missed relations.
+    """
+    if sampled_chunks_df.empty:
+        return []
+
+    chunk_lookup = chunks_df.set_index("chunk_id").to_dict("index")
+    inputs_by_chunk: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for item in glirel_inputs:
+        inputs_by_chunk[str(item.get("chunk_id") or "")].append(item)
+
+    predictions_by_chunk: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for record in raw_prediction_records:
+        predictions_by_chunk[str(record.get("chunk_id") or "")].append(record)
+
+    records: list[Dict[str, Any]] = []
+    for row in sampled_chunks_df.to_dict("records"):
+        chunk_id = str(row.get("chunk_id") or "")
+        chunk = chunk_lookup.get(chunk_id, {})
+
+        mentions_by_id: dict[str, Dict[str, Any]] = {}
+        window_records: list[Dict[str, Any]] = []
+        for item in inputs_by_chunk.get(chunk_id, []):
+            window_records.append(
+                {
+                    "input_id": item.get("input_id"),
+                    "text": item.get("text"),
+                    "window_start_token": item.get("window_start_token"),
+                    "window_end_token": item.get("window_end_token"),
+                    "candidate_pair_count": item.get("candidate_pair_count"),
+                    "labels": item.get("labels") or [],
+                }
+            )
+            for mention in item.get("mention_records", []) or []:
+                mention_id = str(mention.get("mention_id") or "")
+                if not mention_id or mention_id in mentions_by_id:
+                    continue
+                mentions_by_id[mention_id] = {
+                    "mention_id": mention.get("mention_id"),
+                    "entity_id": mention.get("entity_id"),
+                    "canonical_name": mention.get("entity_label")
+                    or mention.get("canonical_name"),
+                    "mention_text": mention.get("mention_text"),
+                    "mention_type": mention.get("mention_type"),
+                    "source": mention.get("source"),
+                    "start_char": mention.get("start_char"),
+                    "end_char": mention.get("end_char"),
+                    "token_start": mention.get("token_start"),
+                    "token_end": mention.get("token_end"),
+                }
+
+        model_predictions: list[Dict[str, Any]] = []
+        seen_predictions: set[str] = set()
+        for prediction in predictions_by_chunk.get(chunk_id, []):
+            prediction_id = stable_id(
+                "relation_gold_prediction",
+                split,
+                prediction.get("input_id"),
+                chunk_id,
+                prediction.get("head_mention_id"),
+                prediction.get("tail_mention_id"),
+                prediction.get("predicted_relation_type"),
+            )
+            if prediction_id in seen_predictions:
+                continue
+            seen_predictions.add(prediction_id)
+            model_predictions.append(
+                {
+                    "relation_id": prediction_id,
+                    "input_id": prediction.get("input_id"),
+                    "head_mention_id": prediction.get("head_mention_id"),
+                    "tail_mention_id": prediction.get("tail_mention_id"),
+                    "head_entity_id": prediction.get("head_entity_id"),
+                    "tail_entity_id": prediction.get("tail_entity_id"),
+                    "head_text": prediction.get("head_text"),
+                    "tail_text": prediction.get("tail_text"),
+                    "head_canonical_name": prediction.get("head_canonical_name"),
+                    "tail_canonical_name": prediction.get("tail_canonical_name"),
+                    "head_type": prediction.get("head_type"),
+                    "tail_type": prediction.get("tail_type"),
+                    "relation_type": prediction.get("predicted_relation_type"),
+                    "relation_family": prediction.get("predicted_relation_family"),
+                    "glirel_label": prediction.get("predicted_glirel_label"),
+                    "score": prediction.get("predicted_score"),
+                    "score_band": prediction.get("score_band"),
+                    "allowed_relation_types": prediction.get("allowed_relation_types")
+                    or [],
+                    "evidence_text": prediction.get("text"),
+                    "correction_notes": "",
+                }
+            )
+
+        records.append(
+            {
+                "sample_id": stable_id("relation_gold_chunk", split, chunk_id),
+                "split": split,
+                "chunk_id": chunk_id,
+                "document_id": row.get("document_id") or chunk.get("document_id"),
+                "dataset": row.get("dataset") or chunk.get("dataset"),
+                "modality": row.get("modality") or chunk.get("modality"),
+                "text": chunk.get("chunk_text", ""),
+                "entity_count": int(row.get("entity_count") or 0),
+                "valid_schema_pair_count": int(
+                    row.get("valid_schema_pair_count") or 0
+                ),
+                "entity_types": row.get("entity_types") or [],
+                "relation_families": row.get("relation_families") or [],
+                "has_refined_entity": bool(row.get("has_refined_entity")),
+                "has_local_entity": bool(row.get("has_local_entity")),
+                "has_refined_local_pair": bool(row.get("has_refined_local_pair")),
+                "mentions": sorted(
+                    mentions_by_id.values(),
+                    key=lambda mention: (
+                        int(mention.get("start_char") or 0),
+                        str(mention.get("mention_id") or ""),
+                    ),
+                ),
+                "glirel_windows": window_records,
+                "model_predictions": model_predictions,
+                "gold_relations": [dict(prediction) for prediction in model_predictions],
+                "annotation_notes": "",
+            }
+        )
+    return records
+
+
 def write_jsonl_records(
     records: Sequence[Mapping[str, Any]],
     output_jsonl: str | Path,
@@ -1736,9 +2193,11 @@ def glirel_inputs_to_diagnostic_records(
                 "sample_id": stable_id(
                     "relation_glirel_input_diagnostic",
                     split,
+                    item.get("input_id"),
                     item.get("chunk_id"),
                 ),
                 "split": split,
+                "input_id": item.get("input_id"),
                 "chunk_id": item.get("chunk_id"),
                 "document_id": item.get("document_id"),
                 "dataset": item.get("dataset"),
@@ -1746,6 +2205,9 @@ def glirel_inputs_to_diagnostic_records(
                 "token_count": len(item.get("tokens") or []),
                 "ner_count": len(item.get("ner") or []),
                 "unique_entity_count": len(entity_ids),
+                "window_start_token": item.get("window_start_token"),
+                "window_end_token": item.get("window_end_token"),
+                "pair_token_gap": item.get("pair_token_gap"),
                 "allowed_type_pairs": sorted(type_pairs),
                 "allowed_relation_types": sorted(allowed_relation_types),
                 "text": item.get("text"),
@@ -1804,6 +2266,256 @@ def summarize_relation_gold_records(
         .value_counts(dropna=False)
         .to_dict(),
     }
+
+
+def read_relation_gold_jsonl(path: str | Path) -> list[Dict[str, Any]]:
+    """Read chunk-centered relation gold JSONL records."""
+    records: list[Dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+def _relation_edge_key(relation: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Return the graph-edge key used for relation threshold evaluation."""
+    return (
+        str(relation.get("head_entity_id") or ""),
+        str(relation.get("tail_entity_id") or ""),
+        str(relation.get("relation_type") or "").upper(),
+    )
+
+
+def _relation_group_value(
+    record: Mapping[str, Any],
+    relation: Mapping[str, Any],
+    group_field: str,
+) -> Any:
+    if group_field in relation:
+        return relation.get(group_field)
+    if group_field == "relation_family":
+        return relation.get("relation_family") or RELATION_FAMILY_BY_TYPE.get(
+            str(relation.get("relation_type") or "").upper(),
+            "other",
+        )
+    return record.get(group_field)
+
+
+def relation_gold_summary(
+    records: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize corrected chunk-centered relation gold records."""
+    gold = [
+        relation
+        for record in records
+        for relation in (record.get("gold_relations") or [])
+    ]
+    predictions = [
+        relation
+        for record in records
+        for relation in (record.get("model_predictions") or [])
+    ]
+    gold_families = Counter(
+        relation.get("relation_family")
+        or RELATION_FAMILY_BY_TYPE.get(str(relation.get("relation_type") or ""), "other")
+        for relation in gold
+    )
+    gold_types = Counter(str(relation.get("relation_type") or "") for relation in gold)
+    return {
+        "chunks": int(len(records)),
+        "chunks_with_gold": int(
+            sum(bool(record.get("gold_relations")) for record in records)
+        ),
+        "chunks_with_model_predictions": int(
+            sum(bool(record.get("model_predictions")) for record in records)
+        ),
+        "gold_relations": int(len(gold)),
+        "model_predictions": int(len(predictions)),
+        "gold_relation_types": int(len(gold_types)),
+        "gold_relation_families": int(len(gold_families)),
+        "gold_by_type": dict(gold_types.most_common()),
+        "gold_by_family": dict(gold_families.most_common()),
+        "datasets": dict(Counter(record.get("dataset") for record in records).most_common()),
+        "modalities": dict(
+            Counter(record.get("modality") for record in records).most_common()
+        ),
+    }
+
+
+def _deduplicate_relation_predictions(
+    predictions: Sequence[Mapping[str, Any]],
+    *,
+    threshold: float,
+) -> dict[tuple[str, str, str], Mapping[str, Any]]:
+    """Keep the highest-score prediction per directed entity/relation key."""
+    best_by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for prediction in predictions:
+        try:
+            score = float(prediction.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if score < threshold:
+            continue
+        key = _relation_edge_key(prediction)
+        if not all(key):
+            continue
+        current = best_by_key.get(key)
+        current_score = float(current.get("score") or 0.0) if current else -1.0
+        if current is None or score > current_score:
+            best_by_key[key] = prediction
+    return best_by_key
+
+
+def evaluate_relation_gold_threshold(
+    records: Sequence[Mapping[str, Any]],
+    threshold: float,
+    *,
+    group_field: str | None = None,
+) -> Dict[str, Any]:
+    """Evaluate GLiREL predictions against corrected relation gold at one threshold."""
+    gold_by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    prediction_candidates: list[Mapping[str, Any]] = []
+    gold_group_by_key: dict[tuple[str, str, str], Any] = {}
+    prediction_group_by_key: dict[tuple[str, str, str], Any] = {}
+
+    for record in records:
+        for relation in record.get("gold_relations") or []:
+            key = _relation_edge_key(relation)
+            if all(key):
+                gold_by_key.setdefault(key, relation)
+                if group_field is not None:
+                    gold_group_by_key.setdefault(
+                        key,
+                        _relation_group_value(record, relation, group_field),
+                    )
+        for prediction in record.get("model_predictions") or []:
+            prediction_candidates.append(prediction)
+            if group_field is not None:
+                key = _relation_edge_key(prediction)
+                if all(key):
+                    prediction_group_by_key.setdefault(
+                        key,
+                        _relation_group_value(record, prediction, group_field),
+                    )
+
+    predictions_by_key = _deduplicate_relation_predictions(
+        prediction_candidates,
+        threshold=threshold,
+    )
+    gold_keys = set(gold_by_key)
+    predicted_keys = set(predictions_by_key)
+    tp_keys = gold_keys & predicted_keys
+    fp_keys = predicted_keys - gold_keys
+    fn_keys = gold_keys - predicted_keys
+
+    if group_field is not None:
+        group_values = set()
+        for key in gold_keys:
+            group_values.add(gold_group_by_key.get(key))
+        for key in predicted_keys:
+            group_values.add(prediction_group_by_key.get(key))
+        rows: list[Dict[str, Any]] = []
+        for group_value in sorted(group_values, key=lambda value: str(value)):
+            group_gold = {
+                key
+                for key in gold_keys
+                if gold_group_by_key.get(key) == group_value
+            }
+            group_predicted = {
+                key
+                for key in predicted_keys
+                if prediction_group_by_key.get(key) == group_value
+            }
+            group_tp = group_gold & group_predicted
+            group_fp = group_predicted - group_gold
+            group_fn = group_gold - group_predicted
+            precision = len(group_tp) / len(group_predicted) if group_predicted else 0.0
+            recall = len(group_tp) / len(group_gold) if group_gold else 0.0
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if precision + recall
+                else 0.0
+            )
+            rows.append(
+                {
+                    "threshold": float(threshold),
+                    group_field: group_value,
+                    "predicted": int(len(group_predicted)),
+                    "gold": int(len(group_gold)),
+                    "tp": int(len(group_tp)),
+                    "fp": int(len(group_fp)),
+                    "fn": int(len(group_fn)),
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "f1": float(f1),
+                }
+            )
+        return {"groups": rows}
+
+    precision = len(tp_keys) / len(predicted_keys) if predicted_keys else 0.0
+    recall = len(tp_keys) / len(gold_keys) if gold_keys else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+    return {
+        "threshold": float(threshold),
+        "chunks": int(len(records)),
+        "gold": int(len(gold_keys)),
+        "predicted": int(len(predicted_keys)),
+        "tp": int(len(tp_keys)),
+        "fp": int(len(fp_keys)),
+        "fn": int(len(fn_keys)),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+    }
+
+
+def tune_relation_extraction_thresholds(
+    records: Sequence[Mapping[str, Any]],
+    thresholds: Sequence[float],
+    *,
+    group_fields: Sequence[str] = ("relation_family", "relation_type", "dataset", "modality"),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate relation extraction over thresholds overall and by group."""
+    overall_rows = [
+        evaluate_relation_gold_threshold(records, float(threshold))
+        for threshold in thresholds
+    ]
+    group_rows: list[Dict[str, Any]] = []
+    for threshold in thresholds:
+        for group_field in group_fields:
+            grouped = evaluate_relation_gold_threshold(
+                records,
+                float(threshold),
+                group_field=group_field,
+            )
+            for row in grouped["groups"]:
+                row["group_field"] = group_field
+                row["group_value"] = row.get(group_field)
+                group_rows.append(row)
+    return pd.DataFrame(overall_rows), pd.DataFrame(group_rows)
+
+
+def select_relation_threshold(
+    metrics_df: pd.DataFrame,
+    *,
+    precision_floor: float = 0.80,
+) -> pd.Series:
+    """Select highest-recall relation threshold meeting the precision floor."""
+    eligible = metrics_df[metrics_df["precision"] >= precision_floor].copy()
+    if not eligible.empty:
+        return eligible.sort_values(
+            ["recall", "f1", "precision", "threshold"],
+            ascending=[False, False, False, True],
+        ).iloc[0]
+    return metrics_df.sort_values(
+        ["f1", "precision", "recall", "threshold"],
+        ascending=[False, False, False, True],
+    ).iloc[0]
 
 
 def _find_prediction_endpoint(
