@@ -13,6 +13,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from src.archive_schema import append_dataframe_to_csv, stable_id
+from src.graph_kb_skeleton import GRAPH_JSON_COLUMNS
 
 
 LOCAL_COREFERENCE_EXPORT_DIR = (
@@ -21,6 +22,84 @@ LOCAL_COREFERENCE_EXPORT_DIR = (
 LOCAL_NIL_MENTIONS_FILENAME = "nil_mentions.csv"
 LOCAL_COREFERENCE_GOLD_DEV_FILENAME = "local_coreference_gold_dev.jsonl"
 LOCAL_COREFERENCE_GOLD_TEST_FILENAME = "local_coreference_gold_test.jsonl"
+LOCAL_COREFERENCE_PROGRESS_FILENAME = "local_coreference_progress.csv"
+LOCAL_ENTITY_TABLE_COLUMNS = [
+    "entity_id:ID(Entity)",
+    "canonical_name",
+    "entity_type",
+    "external_kb_id",
+    "external_kb",
+    "wikipedia_entity_title",
+    "aliases",
+    "link_score:float",
+    "canonicalization_method",
+    "canonicalizer",
+    "model_name",
+    "model_version",
+    ":LABEL",
+]
+LOCAL_MENTION_ENTITY_EDGE_COLUMNS = [
+    ":START_ID(Mention)",
+    ":END_ID(Entity)",
+    "confidence:float",
+    "canonicalization_method",
+    "canonicalizer",
+    "model_name",
+    ":TYPE",
+]
+LOCAL_COREFERENCE_CLUSTER_COLUMNS = [
+    "cluster_id:ID(LocalCoreferenceCluster)",
+    "entity_id:ID(Entity)",
+    "canonical_name",
+    "entity_type",
+    "cluster_size:int",
+    "cluster_min_similarity:float",
+    "cluster_mean_similarity:float",
+    "aliases",
+    "mention_ids",
+    "dataset_values",
+    "modality_values",
+    "document_ids",
+    "block_key",
+    "canonicalization_status",
+    "canonicalization_method",
+    "canonicalizer",
+    "model_name",
+    "model_version",
+    ":LABEL",
+]
+LOCAL_COREFERENCE_PREDICTION_COLUMNS = [
+    "mention_id",
+    "chunk_id",
+    "document_id",
+    "dataset",
+    "modality",
+    "mention_text",
+    "mention_type",
+    "normalized_mention_text",
+    "surface_block_key",
+    "block_key",
+    "entity_id",
+    "predicted_local_entity_id",
+    "cluster_id",
+    "canonical_name",
+    "cluster_size:int",
+    "cluster_min_similarity:float",
+    "cluster_mean_similarity:float",
+    "canonicalization_status",
+    "canonicalization_method",
+    "canonicalizer",
+    "model_name",
+    "model_version",
+]
+LOCAL_COREFERENCE_PROGRESS_COLUMNS = ["mention_id"]
+LOCAL_COREFERENCE_JSON_COLUMNS = [
+    *GRAPH_JSON_COLUMNS,
+    "mention_ids",
+    "dataset_values",
+    "modality_values",
+    "document_ids",
+]
 
 DEFAULT_LOCAL_COREFERENCE_TYPES = (
     "PERSON",
@@ -623,6 +702,8 @@ def _emit_local_cluster_predictions(
     model_version: str,
     status: str = "CLUSTERED",
     canonicalizer: str = "contextual_embedding_agglomerative",
+    cluster_min_similarity: Optional[float] = None,
+    cluster_mean_similarity: Optional[float] = None,
 ) -> list[Dict[str, Any]]:
     canonical_name = canonical_name_for_local_cluster(cluster_df)
     entity_id = stable_id(
@@ -632,9 +713,14 @@ def _emit_local_cluster_predictions(
         "|".join(sorted(cluster_df["mention_id"].astype(str))),
     )
     cluster_id = stable_id("local_cluster", entity_id)
-    cluster_min_similarity, cluster_mean_similarity = _cluster_similarity_stats(
-        cluster_embeddings
-    )
+    if cluster_min_similarity is None or cluster_mean_similarity is None:
+        computed_min_similarity, computed_mean_similarity = _cluster_similarity_stats(
+            cluster_embeddings
+        )
+        if cluster_min_similarity is None:
+            cluster_min_similarity = computed_min_similarity
+        if cluster_mean_similarity is None:
+            cluster_mean_similarity = computed_mean_similarity
 
     return [
         _local_prediction_row(
@@ -720,6 +806,8 @@ def cluster_local_nil_mentions(
                         model_version=model_version,
                         status="EXACT_SURFACE_CLUSTERED",
                         canonicalizer="exact_surface_local_coreference",
+                        cluster_min_similarity=1.0,
+                        cluster_mean_similarity=1.0,
                     )
                 )
 
@@ -1119,6 +1207,510 @@ def load_chunks_for_nil_mentions(
     if not frames:
         return pd.DataFrame(columns=["chunk_id", text_column])
     return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def load_completed_local_coreference_mention_ids(
+    export_dir: str | Path = LOCAL_COREFERENCE_EXPORT_DIR,
+    *,
+    chunksize: int = 250_000,
+) -> set[str]:
+    """Load mention IDs already checkpointed by local NIL canonicalization."""
+    progress_path = Path(export_dir) / LOCAL_COREFERENCE_PROGRESS_FILENAME
+    if not progress_path.exists():
+        return set()
+
+    completed_mention_ids: set[str] = set()
+    for progress_df in pd.read_csv(
+        progress_path,
+        usecols=["mention_id"],
+        dtype={"mention_id": "string"},
+        chunksize=chunksize,
+    ):
+        completed_mention_ids.update(progress_df["mention_id"].dropna().astype(str))
+    return completed_mention_ids
+
+
+def load_existing_local_entity_ids(export_dir: str | Path = LOCAL_COREFERENCE_EXPORT_DIR) -> set[str]:
+    """Load local entity IDs already written by local NIL canonicalization."""
+    entity_path = Path(export_dir) / "local_entities.csv"
+    if not entity_path.exists():
+        return set()
+    entity_df = pd.read_csv(entity_path, usecols=["entity_id:ID(Entity)"])
+    return set(entity_df["entity_id:ID(Entity)"].dropna().astype(str))
+
+
+def load_next_local_coreference_nil_batch(
+    nil_mentions_csv: str | Path,
+    *,
+    completed_mention_ids: set[str] | None = None,
+    eligible_types: Sequence[str] = DEFAULT_LOCAL_COREFERENCE_TYPES,
+    max_mentions: Optional[int] = None,
+    chunksize: int = 250_000,
+) -> pd.DataFrame:
+    """Load the next resumable block-complete slice of unprocessed NIL mentions.
+
+    When ``max_mentions`` is set, the returned batch may be slightly larger than
+    the cap so that selected guarded blocks are not split across resumable runs.
+    """
+    completed_mention_ids = completed_mention_ids or set()
+    eligible_type_set = {str(mention_type).upper() for mention_type in eligible_types}
+    frames: list[pd.DataFrame] = []
+    loaded = 0
+    selected_block_keys: set[str] = set()
+    accepting_new_blocks = True
+
+    for chunk_df in pd.read_csv(nil_mentions_csv, chunksize=chunksize):
+        chunk_df["mention_id"] = chunk_df["mention_id"].astype(str)
+        chunk_df["mention_type"] = chunk_df["mention_type"].astype(str).str.upper()
+        chunk_df = chunk_df[chunk_df["mention_type"].isin(eligible_type_set)].copy()
+        if completed_mention_ids:
+            chunk_df = chunk_df[~chunk_df["mention_id"].isin(completed_mention_ids)].copy()
+        if chunk_df.empty:
+            continue
+
+        if "normalized_mention_text" not in chunk_df.columns:
+            chunk_df["normalized_mention_text"] = chunk_df["mention_text"].map(
+                normalize_local_coreference_surface
+            )
+        if "surface_block_key" not in chunk_df.columns:
+            chunk_df["surface_block_key"] = chunk_df["mention_text"].map(
+                local_coreference_surface_block_key
+            )
+        chunk_df["block_key"] = chunk_df.apply(guarded_local_coreference_block_key, axis=1)
+
+        keep_mask = []
+        for _, row in chunk_df.iterrows():
+            block_key = str(row.get("block_key") or "")
+            keep_row = block_key in selected_block_keys
+            if not keep_row and accepting_new_blocks:
+                selected_block_keys.add(block_key)
+                keep_row = True
+            keep_mask.append(keep_row)
+            if keep_row:
+                loaded += 1
+            if max_mentions is not None and loaded >= max_mentions:
+                accepting_new_blocks = False
+
+        chunk_df = chunk_df[keep_mask].copy()
+        if chunk_df.empty:
+            continue
+
+        frames.append(chunk_df)
+
+    if not frames:
+        return pd.DataFrame(columns=NIL_MENTION_COLUMNS)
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def build_local_coreference_export_tables(
+    predictions_df: pd.DataFrame,
+    *,
+    existing_entity_ids: Optional[set[str]] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Build Neo4j-ready local Entity nodes, REFERS_TO edges, and cluster audit rows."""
+    existing_entity_ids = existing_entity_ids or set()
+    if predictions_df.empty:
+        return {
+            "local_entities": pd.DataFrame(columns=LOCAL_ENTITY_TABLE_COLUMNS),
+            "local_mention_refers_to_entity": pd.DataFrame(
+                columns=LOCAL_MENTION_ENTITY_EDGE_COLUMNS
+            ),
+            "local_coreference_clusters": pd.DataFrame(
+                columns=LOCAL_COREFERENCE_CLUSTER_COLUMNS
+            ),
+            "local_coreference_predictions": pd.DataFrame(
+                columns=LOCAL_COREFERENCE_PREDICTION_COLUMNS
+            ),
+        }
+
+    predictions = predictions_df.copy()
+    if "entity_id" not in predictions.columns:
+        predictions["entity_id"] = predictions.get("predicted_local_entity_id")
+
+    clustered_df = predictions[
+        predictions["entity_id"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    batch_entity_ids: set[str] = set()
+    entity_rows: list[Dict[str, Any]] = []
+    edge_rows: list[Dict[str, Any]] = []
+    cluster_rows: list[Dict[str, Any]] = []
+
+    for entity_id, entity_df in clustered_df.groupby("entity_id", sort=False):
+        entity_id = str(entity_id)
+        aliases = sorted(
+            {
+                str(value).strip()
+                for value in entity_df["mention_text"].dropna().tolist()
+                if str(value).strip()
+            }
+        )
+        mention_ids = sorted(entity_df["mention_id"].dropna().astype(str).unique())
+        dataset_values = sorted(entity_df["dataset"].dropna().astype(str).unique())
+        modality_values = sorted(entity_df["modality"].dropna().astype(str).unique())
+        document_ids = sorted(entity_df["document_id"].dropna().astype(str).unique())
+        first_row = entity_df.iloc[0]
+        canonical_name = str(first_row.get("canonical_name") or (aliases[0] if aliases else ""))
+        entity_type = str(first_row.get("mention_type") or "").upper()
+        confidence = _safe_float(first_row.get("cluster_mean_similarity:float"))
+        canonicalization_method = str(
+            first_row.get("canonicalization_method") or "local_coreference_cluster"
+        )
+        canonicalizer = str(first_row.get("canonicalizer") or "")
+        model_name = str(first_row.get("model_name") or "")
+        model_version = str(first_row.get("model_version") or "")
+
+        if entity_id not in existing_entity_ids and entity_id not in batch_entity_ids:
+            entity_rows.append(
+                {
+                    "entity_id:ID(Entity)": entity_id,
+                    "canonical_name": canonical_name,
+                    "entity_type": entity_type,
+                    "external_kb_id": None,
+                    "external_kb": None,
+                    "wikipedia_entity_title": None,
+                    "aliases": aliases,
+                    "link_score:float": confidence,
+                    "canonicalization_method": canonicalization_method,
+                    "canonicalizer": canonicalizer,
+                    "model_name": model_name,
+                    "model_version": model_version,
+                    ":LABEL": "Entity",
+                }
+            )
+            batch_entity_ids.add(entity_id)
+
+        for _, row in entity_df.iterrows():
+            edge_rows.append(
+                {
+                    ":START_ID(Mention)": row.get("mention_id"),
+                    ":END_ID(Entity)": entity_id,
+                    "confidence:float": _safe_float(row.get("cluster_mean_similarity:float")),
+                    "canonicalization_method": row.get("canonicalization_method"),
+                    "canonicalizer": row.get("canonicalizer"),
+                    "model_name": row.get("model_name"),
+                    ":TYPE": "REFERS_TO",
+                }
+            )
+
+        cluster_id = str(first_row.get("cluster_id") or stable_id("local_cluster", entity_id))
+        cluster_rows.append(
+            {
+                "cluster_id:ID(LocalCoreferenceCluster)": cluster_id,
+                "entity_id:ID(Entity)": entity_id,
+                "canonical_name": canonical_name,
+                "entity_type": entity_type,
+                "cluster_size:int": int(len(entity_df)),
+                "cluster_min_similarity:float": _safe_float(
+                    first_row.get("cluster_min_similarity:float")
+                ),
+                "cluster_mean_similarity:float": confidence,
+                "aliases": aliases,
+                "mention_ids": mention_ids,
+                "dataset_values": dataset_values,
+                "modality_values": modality_values,
+                "document_ids": document_ids,
+                "block_key": first_row.get("block_key"),
+                "canonicalization_status": first_row.get("canonicalization_status"),
+                "canonicalization_method": canonicalization_method,
+                "canonicalizer": canonicalizer,
+                "model_name": model_name,
+                "model_version": model_version,
+                ":LABEL": "LocalCoreferenceCluster",
+            }
+        )
+
+    prediction_export = predictions.reindex(columns=LOCAL_COREFERENCE_PREDICTION_COLUMNS)
+    return {
+        "local_entities": pd.DataFrame(entity_rows, columns=LOCAL_ENTITY_TABLE_COLUMNS),
+        "local_mention_refers_to_entity": pd.DataFrame(
+            edge_rows,
+            columns=LOCAL_MENTION_ENTITY_EDGE_COLUMNS,
+        ),
+        "local_coreference_clusters": pd.DataFrame(
+            cluster_rows,
+            columns=LOCAL_COREFERENCE_CLUSTER_COLUMNS,
+        ),
+        "local_coreference_predictions": prediction_export,
+    }
+
+
+def append_local_coreference_export_tables(
+    tables: Mapping[str, pd.DataFrame],
+    export_dir: str | Path = LOCAL_COREFERENCE_EXPORT_DIR,
+) -> Dict[str, Path]:
+    """Append local coreference export tables to CSV files."""
+    export_path = Path(export_dir)
+    export_path.mkdir(parents=True, exist_ok=True)
+    exported_paths: Dict[str, Path] = {}
+    for table_name, table in tables.items():
+        csv_path = export_path / f"{table_name}.csv"
+        exported_paths[table_name] = append_dataframe_to_csv(
+            table,
+            csv_path,
+            json_columns=LOCAL_COREFERENCE_JSON_COLUMNS,
+        )
+    return exported_paths
+
+
+def append_local_coreference_progress(
+    mention_ids: Iterable[str],
+    export_dir: str | Path = LOCAL_COREFERENCE_EXPORT_DIR,
+) -> Path:
+    """Append lightweight progress rows containing only mention IDs."""
+    export_path = Path(export_dir)
+    export_path.mkdir(parents=True, exist_ok=True)
+    progress_path = export_path / LOCAL_COREFERENCE_PROGRESS_FILENAME
+    progress_df = pd.DataFrame(
+        [{"mention_id": str(mention_id)} for mention_id in mention_ids],
+        columns=LOCAL_COREFERENCE_PROGRESS_COLUMNS,
+    )
+    append_dataframe_to_csv(progress_df, progress_path)
+    return progress_path
+
+
+def apply_local_coreference_to_nil_mentions(
+    nil_mentions_csv: str | Path,
+    chunks_csv: str | Path,
+    embedder: Any,
+    *,
+    export_dir: str | Path = LOCAL_COREFERENCE_EXPORT_DIR,
+    eligible_types: Sequence[str] = DEFAULT_LOCAL_COREFERENCE_TYPES,
+    similarity_threshold: float = 0.75,
+    min_cluster_size: int = 2,
+    max_block_size: int = 500,
+    exact_surface_first: bool = True,
+    use_default_type_thresholds: bool = False,
+    text_column: str = "masked_text",
+    embedding_batch_size: int = 8,
+    max_mentions: Optional[int] = 10_000,
+    block_batch_size: int = 25_000,
+    chunksize: int = 250_000,
+    model_name: str = "BAAI/bge-m3",
+    model_version: str = "unspecified",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Apply resumable local NIL canonicalization and append export tables.
+
+    ``max_mentions`` is intentionally supported for dry runs. Set it to ``None``
+    to process all remaining NIL candidates in one run.
+    """
+    if block_batch_size <= 0:
+        raise ValueError("block_batch_size must be positive")
+
+    def iter_prepared_block_batches(prepared_df: pd.DataFrame) -> Iterable[pd.DataFrame]:
+        pending_blocks: list[pd.DataFrame] = []
+        pending_mentions = 0
+        for _, block_df in prepared_df.groupby("block_key", sort=False, dropna=False):
+            block_size = len(block_df)
+            if pending_blocks and pending_mentions + block_size > block_batch_size:
+                yield pd.concat(pending_blocks, ignore_index=True, sort=False)
+                pending_blocks = []
+                pending_mentions = 0
+            if block_size >= block_batch_size:
+                yield block_df.reset_index(drop=True)
+                continue
+            pending_blocks.append(block_df)
+            pending_mentions += block_size
+        if pending_blocks:
+            yield pd.concat(pending_blocks, ignore_index=True, sort=False)
+
+    export_path = Path(export_dir)
+    export_path.mkdir(parents=True, exist_ok=True)
+    completed_mention_ids = load_completed_local_coreference_mention_ids(
+        export_path,
+        chunksize=chunksize,
+    )
+    completed_before = len(completed_mention_ids)
+    existing_entity_ids = load_existing_local_entity_ids(export_path)
+
+    totals = {
+        "processed_mentions": 0,
+        "prepared_mentions": 0,
+        "filtered_mentions": 0,
+        "clustered_mentions": 0,
+        "local_entities": 0,
+        "local_edges": 0,
+        "local_clusters": 0,
+        "mention_batches": 0,
+        "block_batches": 0,
+    }
+    last_exported_paths: Dict[str, Path] = {}
+
+    while max_mentions is None or totals["processed_mentions"] < max_mentions:
+        remaining_cap = (
+            None
+            if max_mentions is None
+            else max(0, max_mentions - totals["processed_mentions"])
+        )
+        if remaining_cap == 0:
+            break
+        mention_batch_cap = (
+            block_batch_size
+            if remaining_cap is None
+            else min(block_batch_size, remaining_cap)
+        )
+
+        batch_mentions_df = load_next_local_coreference_nil_batch(
+            nil_mentions_csv,
+            completed_mention_ids=completed_mention_ids,
+            eligible_types=eligible_types,
+            max_mentions=mention_batch_cap,
+            chunksize=chunksize,
+        )
+        if batch_mentions_df.empty:
+            break
+
+        totals["mention_batches"] += 1
+        if verbose:
+            tqdm.write(
+                "Loaded local coreference NIL mention batch "
+                f"{totals['mention_batches']:,}: {len(batch_mentions_df):,} mentions "
+                f"({len(completed_mention_ids):,} already completed)"
+            )
+
+        chunks_df = load_chunks_for_nil_mentions(
+            chunks_csv,
+            batch_mentions_df,
+            text_column=text_column,
+            chunksize=chunksize,
+        )
+        if verbose:
+            tqdm.write(f"Loaded chunk text for local coreference: {len(chunks_df):,} chunks")
+        prepared_mentions_df = prepare_local_coreference_mentions(
+            batch_mentions_df,
+            chunks_df,
+            eligible_types=eligible_types,
+            text_column=text_column,
+        )
+
+        batch_mention_ids = set(batch_mentions_df["mention_id"].dropna().astype(str))
+        prepared_mention_ids = (
+            set(prepared_mentions_df["mention_id"].dropna().astype(str))
+            if not prepared_mentions_df.empty
+            else set()
+        )
+        filtered_mention_ids = sorted(batch_mention_ids - prepared_mention_ids)
+        if filtered_mention_ids:
+            progress_path = append_local_coreference_progress(filtered_mention_ids, export_path)
+            last_exported_paths["local_coreference_progress"] = progress_path
+            completed_mention_ids.update(filtered_mention_ids)
+
+        totals["processed_mentions"] += len(filtered_mention_ids)
+        totals["filtered_mentions"] += len(filtered_mention_ids)
+
+        if verbose:
+            block_count = (
+                prepared_mentions_df["block_key"].nunique(dropna=False)
+                if not prepared_mentions_df.empty
+                else 0
+            )
+            tqdm.write(
+                "Prepared local coreference mentions: "
+                f"{len(prepared_mentions_df):,} prepared, "
+                f"{len(filtered_mention_ids):,} filtered, "
+                f"{block_count:,} blocks"
+            )
+
+        if prepared_mentions_df.empty:
+            continue
+
+        for prepared_block_batch_df in iter_prepared_block_batches(prepared_mentions_df):
+            totals["block_batches"] += 1
+            block_count = prepared_block_batch_df["block_key"].nunique(dropna=False)
+            if verbose:
+                tqdm.write(
+                    "Embedding local coreference block batch "
+                    f"{totals['block_batches']:,}: "
+                    f"{len(prepared_block_batch_df):,} mentions, {block_count:,} blocks"
+                )
+
+            embeddings = embed_local_mention_contexts(
+                prepared_block_batch_df,
+                embedder,
+                batch_size=embedding_batch_size,
+            )
+            if verbose:
+                tqdm.write(
+                    "Finished local mention embeddings; clustering "
+                    f"{len(prepared_block_batch_df):,} mentions now"
+                )
+            predictions_df = cluster_local_nil_mentions(
+                prepared_block_batch_df,
+                embeddings,
+                similarity_threshold=similarity_threshold,
+                use_default_type_thresholds=use_default_type_thresholds,
+                min_cluster_size=min_cluster_size,
+                max_block_size=max_block_size,
+                exact_surface_first=exact_surface_first,
+                model_name=model_name,
+                model_version=model_version,
+            )
+
+            if verbose:
+                tqdm.write(
+                    "Built local coreference predictions; preparing export tables "
+                    f"for {len(predictions_df):,} prediction rows"
+                )
+            tables = build_local_coreference_export_tables(
+                predictions_df,
+                existing_entity_ids=existing_entity_ids,
+            )
+            if verbose:
+                tqdm.write("Appending local coreference export tables")
+            last_exported_paths.update(
+                append_local_coreference_export_tables(tables, export_path)
+            )
+
+            if not tables["local_entities"].empty:
+                new_entity_ids = set(
+                    tables["local_entities"]["entity_id:ID(Entity)"].dropna().astype(str)
+                )
+                existing_entity_ids.update(new_entity_ids)
+
+            processed_block_mention_ids = sorted(
+                prepared_block_batch_df["mention_id"].dropna().astype(str)
+            )
+            progress_path = append_local_coreference_progress(
+                processed_block_mention_ids,
+                export_path,
+            )
+            last_exported_paths["local_coreference_progress"] = progress_path
+            completed_mention_ids.update(processed_block_mention_ids)
+
+            totals["processed_mentions"] += len(processed_block_mention_ids)
+            totals["prepared_mentions"] += len(prepared_block_batch_df)
+            totals["clustered_mentions"] += int(
+                predictions_df["entity_id"].fillna("").astype(str).str.strip().ne("").sum()
+            )
+            totals["local_entities"] += len(tables["local_entities"])
+            totals["local_edges"] += len(tables["local_mention_refers_to_entity"])
+            totals["local_clusters"] += len(tables["local_coreference_clusters"])
+
+            if max_mentions is not None and totals["processed_mentions"] >= max_mentions:
+                break
+
+    return {
+        **totals,
+        "completed_mentions_before": completed_before,
+        "completed_mentions_after": len(completed_mention_ids),
+        "similarity_threshold": similarity_threshold,
+        "exact_surface_first": exact_surface_first,
+        "use_default_type_thresholds": use_default_type_thresholds,
+        "block_batch_size": block_batch_size,
+        "export_dir": export_path,
+        "exported_paths": last_exported_paths,
+    }
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
 
 
 def sample_local_coreference_gold_candidates(
