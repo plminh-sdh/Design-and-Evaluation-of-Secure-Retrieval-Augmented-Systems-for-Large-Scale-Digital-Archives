@@ -9,6 +9,7 @@ cells can reuse the same loaders and predictors in resumable chunk batches.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from bisect import bisect_left, bisect_right
 import json
 from pathlib import Path
 import random
@@ -192,6 +193,12 @@ RELATION_BY_GLIREL_LABEL = {
     entry.glirel_label: entry.graph_relation for entry in RELATION_SCHEMA
 }
 RELATION_BY_GRAPH_TYPE = {entry.graph_relation: entry for entry in RELATION_SCHEMA}
+ALLOWED_DIRECTED_TYPE_PAIRS = {
+    (head_type, tail_type)
+    for entry in RELATION_SCHEMA
+    for head_type in entry.allowed_head
+    for tail_type in entry.allowed_tail
+}
 RELATION_FAMILY_BY_TYPE = {
     "AFFILIATED_WITH": "actor_affiliation",
     "WORKS_FOR": "actor_affiliation",
@@ -1173,6 +1180,22 @@ def align_char_span_to_token_span(
     return span.start, span.end - 1
 
 
+def align_char_span_to_token_span_fast(
+    token_starts: Sequence[int],
+    token_ends: Sequence[int],
+    start_char: int,
+    end_char: int,
+) -> Optional[tuple[int, int]]:
+    """Map character offsets to inclusive token offsets using precomputed token bounds."""
+    if end_char <= start_char or not token_starts:
+        return None
+    start_token = bisect_right(token_ends, int(start_char))
+    end_token = bisect_left(token_starts, int(end_char)) - 1
+    if start_token < 0 or end_token < start_token or end_token >= len(token_starts):
+        return None
+    return start_token, end_token
+
+
 def build_glirel_chunk_input(
     chunk_row: Mapping[str, Any],
     mentions_df: pd.DataFrame,
@@ -1180,6 +1203,7 @@ def build_glirel_chunk_input(
     *,
     max_entities_per_chunk: int = 40,
     dedupe_entity_spans: bool = True,
+    mentions_are_pre_filtered: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Build one direct-call GLiREL input from chunk text and resolved mentions."""
     chunk_id = str(chunk_row.get("chunk_id") or "")
@@ -1189,31 +1213,39 @@ def build_glirel_chunk_input(
 
     doc = nlp.make_doc(text) if hasattr(nlp, "make_doc") else nlp(text)
     tokens = [token.text for token in doc]
-    mentions = mentions_df[mentions_df["chunk_id"].astype(str) == chunk_id].copy()
+    token_starts = [int(token.idx) for token in doc]
+    token_ends = [int(token.idx) + len(token.text) for token in doc]
+    if mentions_are_pre_filtered:
+        mentions = mentions_df
+    else:
+        mentions = mentions_df[mentions_df["chunk_id"].astype(str) == chunk_id].copy()
     if mentions.empty:
         return None
-    mentions = mentions.sort_values(["start_char", "end_char", "mention_id"])
 
     seen_entity_spans: set[tuple[str, int, int]] = set()
     ner: list[list[Any]] = []
     mention_records: list[Dict[str, Any]] = []
-    for row in mentions.to_dict("records"):
-        token_span = align_char_span_to_token_span(
-            doc,
-            int(row["start_char"]),
-            int(row["end_char"]),
+    for row in mentions.itertuples(index=False):
+        start_char = int(getattr(row, "start_char"))
+        end_char = int(getattr(row, "end_char"))
+        token_span = align_char_span_to_token_span_fast(
+            token_starts,
+            token_ends,
+            start_char,
+            end_char,
         )
         if token_span is None:
             continue
         start_token, end_token = token_span
-        dedupe_key = (str(row["entity_id"]), start_token, end_token)
+        entity_id = str(getattr(row, "entity_id"))
+        dedupe_key = (entity_id, start_token, end_token)
         if dedupe_entity_spans and dedupe_key in seen_entity_spans:
             continue
         seen_entity_spans.add(dedupe_key)
-        mention_text = str(row.get("mention_text") or "")
-        mention_type = str(row.get("mention_type") or "").upper()
+        mention_text = str(getattr(row, "mention_text") or "")
+        mention_type = str(getattr(row, "mention_type") or "").upper()
         ner.append([start_token, end_token, mention_type, mention_text])
-        record = dict(row)
+        record = row._asdict()
         record["ner_index"] = len(ner) - 1
         record["token_start"] = start_token
         record["token_end"] = end_token
@@ -1249,17 +1281,32 @@ def build_glirel_batch_inputs(
 ) -> list[Dict[str, Any]]:
     """Build GLiREL inputs for a loaded chunk batch."""
     inputs: list[Dict[str, Any]] = []
+    if chunks_df.empty or mentions_df.empty:
+        return inputs
+
+    sorted_mentions = mentions_df.sort_values(
+        ["chunk_id", "start_char", "end_char", "mention_id"],
+        kind="mergesort",
+    )
+    mention_groups = {
+        str(chunk_id): group
+        for chunk_id, group in sorted_mentions.groupby("chunk_id", sort=False)
+    }
     for row in tqdm(
         chunks_df.to_dict("records"),
         desc="Building GLiREL chunk inputs",
         unit="chunk",
         disable=not verbose,
     ):
+        chunk_mentions = mention_groups.get(str(row.get("chunk_id") or ""))
+        if chunk_mentions is None or chunk_mentions.empty:
+            continue
         item = build_glirel_chunk_input(
             row,
-            mentions_df,
+            chunk_mentions,
             nlp,
             max_entities_per_chunk=max_entities_per_chunk,
+            mentions_are_pre_filtered=True,
         )
         if item is not None:
             inputs.append(item)
@@ -1268,15 +1315,14 @@ def build_glirel_batch_inputs(
 
 def _chunk_has_allowed_relation_pair(mention_records: Sequence[Mapping[str, Any]]) -> bool:
     for head in mention_records:
+        head_type = str(head.get("mention_type") or "").upper()
+        head_entity_id = str(head.get("entity_id"))
         for tail in mention_records:
             if head is tail:
                 continue
-            if str(head.get("entity_id")) == str(tail.get("entity_id")):
+            if head_entity_id == str(tail.get("entity_id")):
                 continue
-            if relation_labels_for_type_pair(
-                head.get("mention_type"),
-                tail.get("mention_type"),
-            ):
+            if (head_type, str(tail.get("mention_type") or "").upper()) in ALLOWED_DIRECTED_TYPE_PAIRS:
                 return True
     return False
 
@@ -1291,7 +1337,7 @@ def predict_glirel_relations_for_input(
     """Run a GLiREL direct-call prediction for one prepared chunk input."""
     return model.predict_relations(
         glirel_input["tokens"],
-        glirel_input["labels"],
+        glirel_label_list(),
         threshold=threshold,
         ner=glirel_input["ner"],
         top_k=top_k,
@@ -1305,21 +1351,58 @@ def predict_glirel_relations_for_batch(
     threshold: float = 0.8,
     top_k: int = 1,
     verbose: bool = True,
+    batch_size: int = 1,
 ) -> list[Dict[str, Any]]:
-    """Run GLiREL on a prepared batch and attach chunk context to predictions."""
+    """Run GLiREL on prepared inputs and attach chunk context to predictions.
+
+    ``batch_size=1`` is the default because GLiREL's batch API can be slower for
+    archive chunks with highly variable lengths: the padded batch work may cost
+    more than repeated single-example calls. Increase only after measuring on the
+    current hardware/model.
+    """
     predictions: list[Dict[str, Any]] = []
-    for item in tqdm(
-        glirel_inputs,
+    if not glirel_inputs:
+        return predictions
+    if batch_size <= 1 or not hasattr(model, "batch_predict_relations"):
+        for item in tqdm(
+            glirel_inputs,
+            desc="Running GLiREL relation prediction",
+            unit="chunk",
+            disable=not verbose,
+        ):
+            for prediction in predict_glirel_relations_for_input(
+                model,
+                item,
+                threshold=threshold,
+                top_k=top_k,
+            ):
+                enriched = dict(prediction)
+                enriched["chunk_id"] = item.get("chunk_id")
+                enriched["document_id"] = item.get("document_id")
+                enriched["dataset"] = item.get("dataset")
+                enriched["modality"] = item.get("modality")
+                predictions.append(enriched)
+        return predictions
+
+    for start in tqdm(
+        range(0, len(glirel_inputs), batch_size),
         desc="Running GLiREL relation prediction",
-        unit="chunk",
+        unit="batch",
         disable=not verbose,
     ):
-        for prediction in predict_glirel_relations_for_input(
-            model,
-            item,
+        batch_items = list(glirel_inputs[start : start + batch_size])
+        batch_outputs = model.batch_predict_relations(
+            [item["tokens"] for item in batch_items],
+            glirel_label_list(),
             threshold=threshold,
+            ner=[item["ner"] for item in batch_items],
             top_k=top_k,
-        ):
+        )
+        for item, item_predictions in zip(batch_items, batch_outputs):
+            for prediction in item_predictions:
+                glirel_label = str(prediction.get("label") or "")
+                if glirel_label not in RELATION_BY_GLIREL_LABEL:
+                    continue
             enriched = dict(prediction)
             enriched["chunk_id"] = item.get("chunk_id")
             enriched["document_id"] = item.get("document_id")
@@ -1623,6 +1706,70 @@ def write_jsonl_records(
         for record in records:
             handle.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
     return path
+
+
+def glirel_inputs_to_diagnostic_records(
+    glirel_inputs: Sequence[Mapping[str, Any]],
+    *,
+    split: str,
+) -> list[Dict[str, Any]]:
+    """Convert prepared GLiREL inputs to compact diagnostic JSONL records."""
+    records: list[Dict[str, Any]] = []
+    for item in glirel_inputs:
+        mention_records = list(item.get("mention_records") or [])
+        entity_ids = {str(record.get("entity_id")) for record in mention_records}
+        type_pairs: set[str] = set()
+        allowed_relation_types: set[str] = set()
+        for head in mention_records:
+            for tail in mention_records:
+                if str(head.get("entity_id")) == str(tail.get("entity_id")):
+                    continue
+                head_type = str(head.get("mention_type") or "").upper()
+                tail_type = str(tail.get("mention_type") or "").upper()
+                relation_types = relation_labels_for_type_pair(head_type, tail_type)
+                if not relation_types:
+                    continue
+                type_pairs.add(f"{head_type}->{tail_type}")
+                allowed_relation_types.update(relation_types)
+        records.append(
+            {
+                "sample_id": stable_id(
+                    "relation_glirel_input_diagnostic",
+                    split,
+                    item.get("chunk_id"),
+                ),
+                "split": split,
+                "chunk_id": item.get("chunk_id"),
+                "document_id": item.get("document_id"),
+                "dataset": item.get("dataset"),
+                "modality": item.get("modality"),
+                "token_count": len(item.get("tokens") or []),
+                "ner_count": len(item.get("ner") or []),
+                "unique_entity_count": len(entity_ids),
+                "allowed_type_pairs": sorted(type_pairs),
+                "allowed_relation_types": sorted(allowed_relation_types),
+                "text": item.get("text"),
+                "tokens": item.get("tokens") or [],
+                "ner": item.get("ner") or [],
+                "mentions": [
+                    {
+                        "mention_id": record.get("mention_id"),
+                        "entity_id": record.get("entity_id"),
+                        "canonical_name": record.get("entity_label")
+                        or record.get("canonical_name"),
+                        "mention_text": record.get("mention_text"),
+                        "mention_type": record.get("mention_type"),
+                        "source": record.get("source"),
+                        "start_char": record.get("start_char"),
+                        "end_char": record.get("end_char"),
+                        "token_start": record.get("token_start"),
+                        "token_end": record.get("token_end"),
+                    }
+                    for record in mention_records
+                ],
+            }
+        )
+    return records
 
 
 def summarize_relation_gold_records(
