@@ -50,6 +50,7 @@ class QdrantRetrievalDriver:
     url: str | None
     api_key: str | None
     collection_name: str
+    timeout_seconds: int = 120
 
     @classmethod
     def from_environment(
@@ -61,6 +62,7 @@ class QdrantRetrievalDriver:
         api_key_env: str = "QDRANT_CLUSTER_API_KEY",
         collection_name_env: str = "QDRANT_COLLECTION_NAME",
         default_collection_name: str = "archive-chunks",
+        timeout_seconds: int = 120,
     ) -> "QdrantRetrievalDriver":
         """Build a Qdrant driver from Colab userdata or local environment variables."""
 
@@ -73,6 +75,7 @@ class QdrantRetrievalDriver:
                 use_colab_userdata=use_colab_userdata,
             )
             or default_collection_name,
+            timeout_seconds=timeout_seconds,
         )
 
     def __post_init__(self) -> None:
@@ -81,7 +84,7 @@ class QdrantRetrievalDriver:
         object.__setattr__(
             self,
             "client",
-            QdrantClient(url=self.url, api_key=self.api_key),
+            QdrantClient(url=self.url, api_key=self.api_key, timeout=self.timeout_seconds),
         )
 
     def verify_connectivity(self) -> Any:
@@ -95,6 +98,7 @@ class QdrantRetrievalDriver:
         query_filter: Any | None = None,
         with_payload: bool = True,
         with_vectors: bool = False,
+        timeout_seconds: int | None = None,
     ) -> list[Any]:
         """Search the configured Qdrant collection with the default dense vector."""
 
@@ -105,6 +109,7 @@ class QdrantRetrievalDriver:
             query_filter=query_filter,
             with_payload=with_payload,
             with_vectors=with_vectors,
+            timeout=timeout_seconds or self.timeout_seconds,
         )
         return list(response.points)
 
@@ -117,6 +122,7 @@ class QdrantRetrievalDriver:
         query_filter: Any | None = None,
         with_payload: bool = True,
         with_vectors: bool = False,
+        timeout_seconds: int | None = None,
     ) -> list[Any]:
         """Search a named dense vector in the configured collection."""
 
@@ -128,6 +134,7 @@ class QdrantRetrievalDriver:
             query_filter=query_filter,
             with_payload=with_payload,
             with_vectors=with_vectors,
+            timeout=timeout_seconds or self.timeout_seconds,
         )
         return list(response.points)
 
@@ -140,6 +147,7 @@ class QdrantRetrievalDriver:
         query_filter: Any | None = None,
         with_payload: bool = True,
         with_vectors: bool = False,
+        timeout_seconds: int | None = None,
     ) -> list[Any]:
         """Search a named sparse vector in the configured collection."""
 
@@ -151,6 +159,7 @@ class QdrantRetrievalDriver:
             query_filter=query_filter,
             with_payload=with_payload,
             with_vectors=with_vectors,
+            timeout=timeout_seconds or self.timeout_seconds,
         )
         return list(response.points)
 
@@ -167,6 +176,7 @@ class QdrantRetrievalDriver:
         with_payload: bool = True,
         with_vectors: bool = False,
         rrf_k: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> list[Any]:
         """Search dense+sparse vectors with Qdrant's server-side RRF fusion."""
 
@@ -196,6 +206,7 @@ class QdrantRetrievalDriver:
             limit=top_k,
             with_payload=with_payload,
             with_vectors=with_vectors,
+            timeout=timeout_seconds or self.timeout_seconds,
         )
         return list(response.points)
 
@@ -207,6 +218,7 @@ class QdrantRetrievalDriver:
         with_payload: bool = True,
         with_vectors: bool = False,
         rrf_k: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> list[Any]:
         """Search with caller-built Qdrant prefetches and server-side RRF fusion."""
 
@@ -222,6 +234,7 @@ class QdrantRetrievalDriver:
             limit=top_k,
             with_payload=with_payload,
             with_vectors=with_vectors,
+            timeout=timeout_seconds or self.timeout_seconds,
         )
         return list(response.points)
 

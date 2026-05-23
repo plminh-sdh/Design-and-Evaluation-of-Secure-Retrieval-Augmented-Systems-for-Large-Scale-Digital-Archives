@@ -453,8 +453,36 @@ class GraphExpandedHybridRetriever:
     method_name: str = "graph_expanded_hybrid"
     rrf_k: int | None = None
     prefetch_multiplier: int = 5
-    min_prefetch_limit: int = 20
+    min_prefetch_limit: int = 10
     last_debug: dict[str, Any] = field(default_factory=dict)
+    retrieval_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
+    debug_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def _cache_enabled(
+        self,
+        *,
+        query_filter: Any | None,
+        with_payload: bool,
+    ) -> bool:
+        return query_filter is None and with_payload
+
+    def _cached_results(self, query_id: str, top_k: int) -> pd.DataFrame | None:
+        cached_df = self.retrieval_cache.get(str(query_id))
+        if cached_df is None or len(cached_df) < top_k:
+            return None
+        self.last_debug = self.debug_cache.get(str(query_id), {})
+        return cached_df.head(top_k).copy()
+
+    def _store_cache(
+        self,
+        query_id: str,
+        results_df: pd.DataFrame,
+        expansion: Mapping[str, Any],
+    ) -> None:
+        cached_df = self.retrieval_cache.get(str(query_id))
+        if cached_df is None or len(results_df) > len(cached_df):
+            self.retrieval_cache[str(query_id)] = results_df.copy()
+            self.debug_cache[str(query_id)] = dict(expansion)
 
     def retrieve(
         self,
@@ -466,6 +494,12 @@ class GraphExpandedHybridRetriever:
         with_payload: bool = True,
         debug: bool = False,
     ) -> pd.DataFrame:
+        if self._cache_enabled(query_filter=query_filter, with_payload=with_payload):
+            cached_df = self._cached_results(query_id, top_k)
+            if cached_df is not None:
+                _debug_print(debug, f"[graph-retrieval] cache hit for query_id={query_id}")
+                return cached_df
+
         started_at = time.perf_counter()
         _debug_print(debug, "[graph-retrieval] start graph-expanded hybrid retrieval")
         expansion = self.graph_expander.expand(query, debug=debug)
@@ -524,6 +558,8 @@ class GraphExpandedHybridRetriever:
             results_df["graph_relation_phrases"] = "; ".join(expansion.get("relation_phrases") or [])
 
         self.last_debug = expansion
+        if self._cache_enabled(query_filter=query_filter, with_payload=with_payload):
+            self._store_cache(query_id, results_df, expansion)
         if debug:
             self.print_debug(expansion)
             print(f"\n[graph-retrieval] total retrieval time: {_elapsed_ms(started_at):.1f} ms")
@@ -603,6 +639,34 @@ class GraphExpandedHybridReranker:
     neighbor_entity_boost: float = 0.08
     typed_relation_boost: float = 0.10
     last_debug: dict[str, Any] = field(default_factory=dict)
+    retrieval_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
+    debug_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def _cache_enabled(
+        self,
+        *,
+        query_filter: Any | None,
+        with_payload: bool,
+    ) -> bool:
+        return query_filter is None and with_payload
+
+    def _cached_results(self, query_id: str, top_k: int) -> pd.DataFrame | None:
+        cached_df = self.retrieval_cache.get(str(query_id))
+        if cached_df is None or len(cached_df) < top_k:
+            return None
+        self.last_debug = self.debug_cache.get(str(query_id), {})
+        return cached_df.head(top_k).copy()
+
+    def _store_cache(
+        self,
+        query_id: str,
+        results_df: pd.DataFrame,
+        debug_state: Mapping[str, Any],
+    ) -> None:
+        cached_df = self.retrieval_cache.get(str(query_id))
+        if cached_df is None or len(results_df) > len(cached_df):
+            self.retrieval_cache[str(query_id)] = results_df.copy()
+            self.debug_cache[str(query_id)] = dict(debug_state)
 
     def retrieve(
         self,
@@ -614,6 +678,12 @@ class GraphExpandedHybridReranker:
         with_payload: bool = True,
         debug: bool = False,
     ) -> pd.DataFrame:
+        if self._cache_enabled(query_filter=query_filter, with_payload=with_payload):
+            cached_df = self._cached_results(query_id, top_k)
+            if cached_df is not None:
+                _debug_print(debug, f"[graph-rerank] cache hit for query_id={query_id}")
+                return cached_df
+
         started_at = time.perf_counter()
         candidate_top_k = max(top_k, top_k * self.candidate_multiplier)
         _debug_print(
@@ -661,6 +731,8 @@ class GraphExpandedHybridReranker:
             "neighbor_entity_ids": neighbor_entity_ids,
             "candidate_features": feature_rows,
         }
+        if self._cache_enabled(query_filter=query_filter, with_payload=with_payload):
+            self._store_cache(query_id, reranked_df, self.last_debug)
         if debug:
             print("\n[graph-rerank] matched entity ids:", matched_entity_ids)
             print("[graph-rerank] neighbor entity ids:", neighbor_entity_ids)

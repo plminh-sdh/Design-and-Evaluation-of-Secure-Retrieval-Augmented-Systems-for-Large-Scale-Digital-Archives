@@ -76,6 +76,8 @@ def retrieve_for_qrels(
     top_k: int,
     query_id_column: str = "query_id",
     query_column: str = "query",
+    max_retries: int = 3,
+    retry_sleep_seconds: float = 3.0,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Run a retriever for each qrel using only the query fields."""
@@ -91,7 +93,28 @@ def retrieve_for_qrels(
     for qrel in iterator:
         query_id = str(qrel.get(query_id_column, ""))
         query = str(qrel.get(query_column, ""))
-        results_df = retriever.retrieve(query, query_id=query_id, top_k=top_k)
+        results_df = pd.DataFrame()
+        last_error: Exception | None = None
+        for attempt in range(1, max(max_retries, 1) + 1):
+            try:
+                results_df = retriever.retrieve(query, query_id=query_id, top_k=top_k)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < max(max_retries, 1):
+                    if verbose:
+                        tqdm.write(
+                            "Retrying retrieval after error "
+                            f"({attempt}/{max_retries}) for query_id={query_id}: {exc!r}"
+                        )
+                    time.sleep(retry_sleep_seconds * attempt)
+        if last_error is not None:
+            if verbose:
+                tqdm.write(
+                    f"Skipping query_id={query_id} after retrieval retries failed: {last_error!r}"
+                )
+            continue
         if not results_df.empty:
             frames.append(results_df)
         iterator.set_postfix(retrieved=sum(len(frame) for frame in frames))
@@ -375,3 +398,119 @@ def summarize_retrieval_judgments(
         )
 
     return pd.DataFrame(rows)
+
+
+def tune_retriever_top_k(
+    *,
+    strategy_name: str,
+    qrels_df: pd.DataFrame,
+    retriever: Any,
+    judge_llm: Any,
+    top_k_candidates: Sequence[int],
+    judgments_jsonl: str | Path,
+    relevance_threshold: int = 2,
+    max_new_tokens: int = 1024,
+    retrieval_max_retries: int = 3,
+    retrieval_retry_sleep_seconds: float = 3.0,
+    max_retries: int = 5,
+    retry_sleep_seconds: float = 2.0,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Retrieve once at max-k, judge once, and summarize candidate top-k values."""
+
+    if not top_k_candidates:
+        raise ValueError("top_k_candidates must not be empty.")
+
+    max_k = max(int(k) for k in top_k_candidates)
+    retrieval_results_df = retrieve_for_qrels(
+        qrels_df,
+        retriever,
+        top_k=max_k,
+        max_retries=retrieval_max_retries,
+        retry_sleep_seconds=retrieval_retry_sleep_seconds,
+        verbose=verbose,
+    )
+    if not retrieval_results_df.empty:
+        retrieval_results_df = retrieval_results_df.copy()
+        retrieval_results_df["evaluation_strategy"] = strategy_name
+
+    judgments_df = judge_retrieval_results(
+        retrieval_results_df,
+        qrels_df,
+        judge_llm,
+        output_jsonl=judgments_jsonl,
+        resume=True,
+        max_new_tokens=max_new_tokens,
+        max_retries=max_retries,
+        retry_sleep_seconds=retry_sleep_seconds,
+        verbose=verbose,
+    )
+    metrics_df = summarize_retrieval_judgments(
+        judgments_df,
+        k_values=top_k_candidates,
+        relevance_threshold=relevance_threshold,
+    )
+    if metrics_df.empty:
+        raise RuntimeError(f"No tuning metrics were produced for {strategy_name}.")
+
+    metrics_df = metrics_df.copy()
+    metrics_df.insert(0, "strategy", strategy_name)
+    best_row = metrics_df.sort_values(
+        ["mean_ndcg", "hit_rate_at_k", "mrr_at_k"],
+        ascending=False,
+    ).iloc[0]
+    return retrieval_results_df, judgments_df, metrics_df, best_row
+
+
+def evaluate_retrieval_strategies(
+    *,
+    strategy_retrievers: Mapping[str, tuple[Any, int]],
+    qrels_df: pd.DataFrame,
+    judge_llm: Any,
+    judgments_dir: str | Path,
+    relevance_threshold: int = 2,
+    max_new_tokens: int = 1024,
+    retrieval_max_retries: int = 3,
+    retrieval_retry_sleep_seconds: float = 3.0,
+    max_retries: int = 5,
+    retry_sleep_seconds: float = 2.0,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """Evaluate named retrievers on a qrel set using their selected top-k values."""
+
+    judgments_dir = Path(judgments_dir)
+    metrics_frames: list[pd.DataFrame] = []
+    retrieval_results_by_strategy: dict[str, pd.DataFrame] = {}
+    judgments_by_strategy: dict[str, pd.DataFrame] = {}
+
+    iterator = tqdm(
+        list(strategy_retrievers.items()),
+        desc="Evaluating retrieval strategies",
+        unit="strategy",
+        disable=not verbose,
+        dynamic_ncols=True,
+    )
+    for strategy_name, (retriever, top_k) in iterator:
+        iterator.set_postfix(strategy=strategy_name, top_k=top_k)
+        retrieval_results_df, judgments_df, metrics_df, _ = tune_retriever_top_k(
+            strategy_name=strategy_name,
+            qrels_df=qrels_df,
+            retriever=retriever,
+            judge_llm=judge_llm,
+            top_k_candidates=[int(top_k)],
+            judgments_jsonl=judgments_dir / f"{strategy_name}_test_judgments.jsonl",
+            relevance_threshold=relevance_threshold,
+            max_new_tokens=max_new_tokens,
+            retrieval_max_retries=retrieval_max_retries,
+            retrieval_retry_sleep_seconds=retrieval_retry_sleep_seconds,
+            max_retries=max_retries,
+            retry_sleep_seconds=retry_sleep_seconds,
+            verbose=verbose,
+        )
+        retrieval_results_by_strategy[strategy_name] = retrieval_results_df
+        judgments_by_strategy[strategy_name] = judgments_df
+        metrics_frames.append(metrics_df)
+
+    if not metrics_frames:
+        return pd.DataFrame(), retrieval_results_by_strategy, judgments_by_strategy
+    return pd.concat(metrics_frames, ignore_index=True), retrieval_results_by_strategy, judgments_by_strategy
