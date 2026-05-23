@@ -8,13 +8,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-import torch
-from huggingface_hub import login
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
 
 QUERY_GENERATION_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-RELEVANCE_JUDGE_MODEL_ID = "google/gemma-2-9b-it"
+RELEVANCE_JUDGE_MODEL_ID = "gpt-5-nano"
 
 QUERY_GENERATION_ALLOWED_QUERY_TYPES = [
     "factual_lookup",
@@ -57,6 +53,10 @@ class HuggingFaceChatLLM:
         self.model_id = model_id
         self.token = token or os.getenv("HUGGING_FACE_TOKEN")
         self.generation_config = generation_config or GenerationConfig()
+
+        import torch
+        from huggingface_hub import login
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         if require_cuda and not torch.cuda.is_available():
             raise RuntimeError(
@@ -178,12 +178,23 @@ class HuggingFaceChatLLM:
         """Generate a response from OpenAI-style chat messages."""
 
         config = self.generation_config
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        try:
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:
+            if "System role not supported" not in str(exc):
+                raise
+            prompt = self.tokenizer.apply_chat_template(
+                self._fold_system_prompt_into_user(messages),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        import torch
 
         with torch.inference_mode():
             output_ids = self.model.generate(
@@ -208,6 +219,32 @@ class HuggingFaceChatLLM:
             ],
             **kwargs,
         )
+
+    @staticmethod
+    def _fold_system_prompt_into_user(
+        messages: list[Mapping[str, str]],
+    ) -> list[dict[str, str]]:
+        """Adapt OpenAI-style system prompts for chat templates without system role."""
+
+        system_parts: list[str] = []
+        folded_messages: list[dict[str, str]] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = str(message.get("content", ""))
+            if role == "system":
+                system_parts.append(content)
+            else:
+                folded_messages.append({"role": role, "content": content})
+
+        if system_parts:
+            system_text = "\n\n".join(part for part in system_parts if part).strip()
+            if folded_messages and folded_messages[0]["role"] == "user":
+                folded_messages[0]["content"] = (
+                    f"{system_text}\n\n{folded_messages[0]['content']}"
+                ).strip()
+            else:
+                folded_messages.insert(0, {"role": "user", "content": system_text})
+        return folded_messages
 
 
 class QueryGenerationLLM(HuggingFaceChatLLM):
@@ -303,11 +340,66 @@ class QueryGenerationLLM(HuggingFaceChatLLM):
         )
 
 
-class RelevanceJudgeLLM(HuggingFaceChatLLM):
-    """Driver for judging retrieved chunks against generated qrels."""
+class OpenAIRelevanceJudgeLLM:
+    """OpenAI-backed driver for judging retrieved chunks against generated qrels."""
 
-    def __init__(self, model_id: str = RELEVANCE_JUDGE_MODEL_ID, **kwargs: Any) -> None:
-        super().__init__(model_id, **kwargs)
+    def __init__(
+        self,
+        model_id: str = RELEVANCE_JUDGE_MODEL_ID,
+        *,
+        api_key: str | None = None,
+        env_path: str = ".env",
+        **_: Any,
+    ) -> None:
+        self.model_id = model_id
+        self.api_key = api_key or self._load_api_key(env_path=env_path)
+        if not self.api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required for the OpenAI relevance judge. "
+                "Set it in .env, the environment, or pass api_key=..."
+            )
+
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "Install the OpenAI SDK first: pip install openai"
+            ) from exc
+
+        self.client = OpenAI(api_key=self.api_key)
+
+    @staticmethod
+    def _load_api_key(*, env_path: str = ".env") -> str | None:
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(env_path)
+        except Exception:
+            pass
+
+        try:
+            from google.colab import userdata
+
+            value = userdata.get("OPENAI_API_KEY")
+            if value:
+                return value
+        except Exception:
+            pass
+
+        return os.getenv("OPENAI_API_KEY")
+
+    @property
+    def device(self) -> str:
+        return "openai_api"
+
+    def device_summary(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "provider": "openai",
+            "device": self.device,
+            "has_cpu_or_disk_offload": False,
+            "api_key_configured": bool(self.api_key),
+        }
 
     def judge_relevance(
         self,
@@ -315,7 +407,10 @@ class RelevanceJudgeLLM(HuggingFaceChatLLM):
         expected_relevant_information: str,
         retrieved_chunk_text: str,
         *,
-        max_new_tokens: int = 384,
+        max_new_tokens: int = 128,
+        temperature: float | None = 0.0,
+        top_p: float | None = 1.0,
+        do_sample: bool | None = False,
     ) -> str:
         system_prompt = (
             "You are a strict retrieval evaluator for an archive search system. "
@@ -354,7 +449,71 @@ class RelevanceJudgeLLM(HuggingFaceChatLLM):
             f"Expected relevant information: {expected_relevant_information}\n\n"
             f"Retrieved chunk:\n{retrieved_chunk_text[:12000]}"
         )
-        return self.prompt(system_prompt, user_prompt, max_new_tokens=max_new_tokens)
+        request = {
+            "model": self.model_id,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "retrieval_relevance_judgment",
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "relevance_score": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 3,
+                            },
+                            "relevance_label": {
+                                "type": "string",
+                                "enum": [
+                                    "irrelevant",
+                                    "related",
+                                    "highly_relevant",
+                                    "perfectly_relevant",
+                                ],
+                            },
+                            "contains_expected_information": {"type": "boolean"},
+                            "missing_information": {"type": "string"},
+                            "supporting_evidence": {"type": "string"},
+                            "rationale": {"type": "string"},
+                        },
+                        "required": [
+                            "relevance_score",
+                            "relevance_label",
+                            "contains_expected_information",
+                            "missing_information",
+                            "supporting_evidence",
+                            "rationale",
+                        ],
+                    },
+                    "strict": True,
+                }
+            },
+            "max_output_tokens": max_new_tokens,
+        }
+        if temperature is not None:
+            request["temperature"] = temperature
+        if top_p is not None:
+            request["top_p"] = top_p
+
+        try:
+            response = self.client.responses.create(**request)
+        except Exception as exc:
+            message = str(exc).lower()
+            if "temperature" not in message and "top_p" not in message:
+                raise
+            request.pop("temperature", None)
+            request.pop("top_p", None)
+            response = self.client.responses.create(**request)
+        return response.output_text.strip()
+
+
+RelevanceJudgeLLM = OpenAIRelevanceJudgeLLM
 
 
 def extract_first_json_object(text: str) -> dict[str, Any]:

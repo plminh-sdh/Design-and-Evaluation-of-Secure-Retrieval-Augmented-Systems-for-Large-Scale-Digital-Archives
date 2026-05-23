@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -81,7 +82,13 @@ def patch_refined_for_py312_windows() -> Dict[str, str]:
         status["transformers_tokenizer"] = f"not_patched: {exc}"
 
     try:
-        import refined.training.fine_tune.fine_tune as refined_fine_tune
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`torch\.cuda\.amp\.GradScaler\(args\.\.\.\)` is deprecated.*",
+                category=FutureWarning,
+            )
+            import refined.training.fine_tune.fine_tune as refined_fine_tune
         from torch.utils.data import DataLoader as TorchDataLoader
 
         def single_worker_dataloader(*args: Any, **kwargs: Any) -> Any:
@@ -132,6 +139,67 @@ def load_refined_model(
         use_precomputed_descriptions=use_precomputed_descriptions,
         device=device,
     )
+
+
+def refined_precomputed_description_embedding_paths(
+    model_name: str | Path,
+    *,
+    entity_set: str,
+) -> List[Path]:
+    """Return existing ReFinED precomputed entity-description embedding files."""
+
+    model_dir = Path(model_name)
+    if not model_dir.exists() or not model_dir.is_dir():
+        return []
+    return sorted(model_dir.glob(f"precomputed_entity_descriptions_emb_{entity_set}_*-*.np"))
+
+
+def ensure_refined_precomputed_description_embeddings(
+    *,
+    model_name: str | Path,
+    entity_set: str,
+    device: Optional[str] = None,
+    force: bool = False,
+) -> Path:
+    """Generate ReFinED description-embedding cache for a fine-tuned checkpoint.
+
+    ReFinED expects fine-tuned checkpoint directories to contain a file named like
+    ``precomputed_entity_descriptions_emb_wikipedia_6269457-300.np`` when loading
+    with ``use_precomputed_descriptions=True``. If the file is missing, inference
+    can still run, but entity linking is significantly slower. This helper loads
+    the model once with raw descriptions, writes the memmap cache, and returns
+    the generated path.
+    """
+
+    model_dir = Path(model_name)
+    if not model_dir.exists():
+        raise FileNotFoundError(f"ReFinED model directory does not exist: {model_dir}")
+
+    existing_paths = refined_precomputed_description_embedding_paths(
+        model_dir,
+        entity_set=entity_set,
+    )
+    if existing_paths and not force:
+        return existing_paths[-1]
+
+    refined_model = load_refined_model(
+        model_name=str(model_dir.resolve()),
+        entity_set=entity_set,
+        use_precomputed_descriptions=False,
+        device=device,
+    )
+    refined_model.precompute_description_embeddings(output_dir=str(model_dir.resolve()))
+
+    generated_paths = refined_precomputed_description_embedding_paths(
+        model_dir,
+        entity_set=entity_set,
+    )
+    if not generated_paths:
+        raise RuntimeError(
+            "ReFinED precompute finished without producing a "
+            f"precomputed_entity_descriptions_emb_{entity_set}_*-*.np file in {model_dir}"
+        )
+    return generated_paths[-1]
 
 
 def load_jsonl_records(path: Path | str) -> List[Dict[str, Any]]:

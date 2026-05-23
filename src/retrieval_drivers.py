@@ -199,6 +199,32 @@ class QdrantRetrievalDriver:
         )
         return list(response.points)
 
+    def search_prefetch_rrf(
+        self,
+        prefetches: Sequence[models.Prefetch],
+        *,
+        top_k: int,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        rrf_k: int | None = None,
+    ) -> list[Any]:
+        """Search with caller-built Qdrant prefetches and server-side RRF fusion."""
+
+        if rrf_k is None:
+            query = models.RrfQuery(rrf=models.Rrf())
+        else:
+            query = models.RrfQuery(rrf=models.Rrf(k=rrf_k))
+
+        response = self.client.query_points(
+            collection_name=self.collection_name,
+            prefetch=list(prefetches),
+            query=query,
+            limit=top_k,
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+        )
+        return list(response.points)
+
 
 @dataclass(frozen=True)
 class Neo4jGraphRetrievalDriver:
@@ -263,11 +289,225 @@ class Neo4jGraphRetrievalDriver:
 
         cypher = """
         MATCH (e:Entity)
-        WHERE toLower(e.name) CONTAINS toLower($query)
-           OR toLower($query) CONTAINS toLower(e.name)
+        WHERE toLower(e.canonical_name) CONTAINS toLower($query)
+           OR toLower($query) CONTAINS toLower(e.canonical_name)
         RETURN e.entity_id AS entity_id,
-               e.name AS entity_name,
+               e.canonical_name AS entity_name,
                e.entity_type AS entity_type
         LIMIT $limit
         """
         return self.run_read_query(cypher, {"query": query, "limit": limit})
+
+    def graph_expansion_hints(
+        self,
+        *,
+        surface_terms: Sequence[str],
+        entity_ids: Sequence[str] | None = None,
+        entity_limit: int = 8,
+        alias_limit: int = 8,
+        neighbor_limit: int = 12,
+        include_mention_surface_lookup: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return entity aliases and one-hop relation neighbors for query expansion."""
+
+        cleaned_surface_terms = [
+            term.strip()
+            for term in surface_terms
+            if term is not None and len(term.strip()) >= 2
+        ]
+        cleaned_entity_ids = [
+            str(entity_id).strip()
+            for entity_id in (entity_ids or [])
+            if entity_id is not None and str(entity_id).strip()
+        ]
+        if not cleaned_surface_terms and not cleaned_entity_ids:
+            return []
+
+        if include_mention_surface_lookup:
+            cypher = """
+            MATCH (e:Entity)
+            WHERE e.entity_id IN $entity_ids
+               OR any(term IN $surface_terms
+                      WHERE toLower(e.canonical_name) CONTAINS toLower(term)
+                         OR toLower(term) CONTAINS toLower(e.canonical_name))
+               OR EXISTS {
+                    MATCH (m:Mention)-[:REFERS_TO]->(e)
+                    WHERE any(term IN $surface_terms
+                              WHERE toLower(m.mention_text) CONTAINS toLower(term)
+                                 OR toLower(term) CONTAINS toLower(m.mention_text))
+               }
+            WITH collect(DISTINCT e)[0..$entity_limit] AS matched_entities
+            UNWIND matched_entities AS e
+            CALL (e) {
+                MATCH (m:Mention)-[:REFERS_TO]->(e)
+                WHERE m.mention_text IS NOT NULL
+                RETURN collect(DISTINCT m.mention_text)[0..$alias_limit] AS aliases
+            }
+            CALL (e) {
+                MATCH (e)-[r]-(neighbor:Entity)
+                WHERE neighbor.canonical_name IS NOT NULL
+                RETURN collect(DISTINCT {
+                    relation_type: type(r),
+                    neighbor_entity_id: neighbor.entity_id,
+                    neighbor_name: neighbor.canonical_name,
+                    neighbor_type: neighbor.entity_type
+                })[0..$neighbor_limit] AS relation_neighbors
+            }
+            RETURN e.entity_id AS entity_id,
+                   e.canonical_name AS canonical_name,
+                   e.entity_type AS entity_type,
+                   aliases AS aliases,
+                   relation_neighbors AS relation_neighbors
+            """
+        else:
+            cypher = """
+            MATCH (e:Entity)
+            WHERE e.entity_id IN $entity_ids
+               OR any(term IN $surface_terms
+                      WHERE toLower(e.canonical_name) CONTAINS toLower(term)
+                         OR toLower(term) CONTAINS toLower(e.canonical_name))
+            WITH collect(DISTINCT e)[0..$entity_limit] AS matched_entities
+            UNWIND matched_entities AS e
+            CALL (e) {
+                MATCH (m:Mention)-[:REFERS_TO]->(e)
+                WHERE m.mention_text IS NOT NULL
+                RETURN collect(DISTINCT m.mention_text)[0..$alias_limit] AS aliases
+            }
+            CALL (e) {
+                MATCH (e)-[r]-(neighbor:Entity)
+                WHERE neighbor.canonical_name IS NOT NULL
+                RETURN collect(DISTINCT {
+                    relation_type: type(r),
+                    neighbor_entity_id: neighbor.entity_id,
+                    neighbor_name: neighbor.canonical_name,
+                    neighbor_type: neighbor.entity_type
+                })[0..$neighbor_limit] AS relation_neighbors
+            }
+            RETURN e.entity_id AS entity_id,
+                   e.canonical_name AS canonical_name,
+                   e.entity_type AS entity_type,
+                   aliases AS aliases,
+                   relation_neighbors AS relation_neighbors
+            """
+        return self.run_read_query(
+            cypher,
+            {
+                "surface_terms": cleaned_surface_terms,
+                "entity_ids": cleaned_entity_ids,
+                "entity_limit": entity_limit,
+                "alias_limit": alias_limit,
+                "neighbor_limit": neighbor_limit,
+            },
+        )
+
+    def graph_expansion_hints_by_entity_ids(
+        self,
+        *,
+        entity_ids: Sequence[str],
+        alias_limit: int = 8,
+        neighbor_limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Return graph expansion hints for already-canonicalized entity IDs."""
+
+        cleaned_entity_ids = [
+            str(entity_id).strip()
+            for entity_id in entity_ids
+            if entity_id is not None and str(entity_id).strip()
+        ]
+        if not cleaned_entity_ids:
+            return []
+
+        cypher = """
+        MATCH (e:Entity)
+        WHERE e.entity_id IN $entity_ids
+        CALL (e) {
+            MATCH (m:Mention)-[:REFERS_TO]->(e)
+            WHERE m.mention_text IS NOT NULL
+            RETURN collect(DISTINCT m.mention_text)[0..$alias_limit] AS aliases
+        }
+        CALL (e) {
+            MATCH (e)-[r]-(neighbor:Entity)
+            WHERE neighbor.canonical_name IS NOT NULL
+            RETURN collect(DISTINCT {
+                relation_type: type(r),
+                neighbor_entity_id: neighbor.entity_id,
+                neighbor_name: neighbor.canonical_name,
+                neighbor_type: neighbor.entity_type
+            })[0..$neighbor_limit] AS relation_neighbors
+        }
+        RETURN e.entity_id AS entity_id,
+               e.canonical_name AS canonical_name,
+               e.entity_type AS entity_type,
+               aliases AS aliases,
+               relation_neighbors AS relation_neighbors
+        """
+        return self.run_read_query(
+            cypher,
+            {
+                "entity_ids": cleaned_entity_ids,
+                "alias_limit": alias_limit,
+                "neighbor_limit": neighbor_limit,
+            },
+        )
+
+    def graph_candidate_chunk_features(
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        matched_entity_ids: Sequence[str],
+        neighbor_entity_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Return bounded graph reranking features for candidate chunk IDs."""
+
+        cleaned_chunk_ids = [
+            str(chunk_id).strip()
+            for chunk_id in chunk_ids
+            if chunk_id is not None and str(chunk_id).strip()
+        ]
+        if not cleaned_chunk_ids:
+            return []
+        cleaned_matched_entity_ids = [
+            str(entity_id).strip()
+            for entity_id in matched_entity_ids
+            if entity_id is not None and str(entity_id).strip()
+        ]
+        cleaned_neighbor_entity_ids = [
+            str(entity_id).strip()
+            for entity_id in neighbor_entity_ids
+            if entity_id is not None and str(entity_id).strip()
+        ]
+
+        cypher = """
+        MATCH (c:Chunk)
+        WHERE c.chunk_id IN $chunk_ids
+        OPTIONAL MATCH (c)-[:MENTIONS]->(:Mention)-[:REFERS_TO]->(matched:Entity)
+        WHERE matched.entity_id IN $matched_entity_ids
+        WITH c, collect(DISTINCT matched.entity_id) AS matched_entities
+        OPTIONAL MATCH (c)-[:MENTIONS]->(:Mention)-[:REFERS_TO]->(neighbor:Entity)
+        WHERE neighbor.entity_id IN $neighbor_entity_ids
+        WITH c,
+             matched_entities,
+             collect(DISTINCT neighbor.entity_id) AS neighbor_entities
+        OPTIONAL MATCH (matched_entity:Entity)-[r]-(other:Entity)
+        WHERE matched_entity.entity_id IN matched_entities
+          AND (
+              other.entity_id IN neighbor_entities
+              OR other.entity_id IN $matched_entity_ids
+              OR other.entity_id IN $neighbor_entity_ids
+          )
+        RETURN c.chunk_id AS chunk_id,
+               matched_entities AS matched_entity_ids,
+               neighbor_entities AS neighbor_entity_ids,
+               collect(DISTINCT type(r)) AS typed_relation_types,
+               size(matched_entities) AS matched_entity_count,
+               size(neighbor_entities) AS neighbor_entity_count,
+               count(DISTINCT r) AS typed_relation_count
+        """
+        return self.run_read_query(
+            cypher,
+            {
+                "chunk_ids": cleaned_chunk_ids,
+                "matched_entity_ids": cleaned_matched_entity_ids,
+                "neighbor_entity_ids": cleaned_neighbor_entity_ids,
+            },
+        )
