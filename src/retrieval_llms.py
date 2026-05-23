@@ -16,6 +16,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 QUERY_GENERATION_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 RELEVANCE_JUDGE_MODEL_ID = "google/gemma-2-9b-it"
 
+QUERY_GENERATION_ALLOWED_QUERY_TYPES = [
+    "factual_lookup",
+    "entity_centric",
+    "event_centric",
+    "relationship_centric",
+    "summary_style",
+    "temporal_contextual",
+    "ocr_document_oriented",
+    "video_caption_oriented",
+]
+QUERY_GENERATION_ALLOWED_DIFFICULTIES = ["easy", "medium", "hard"]
+
 
 @dataclass(frozen=True)
 class GenerationConfig:
@@ -136,28 +148,74 @@ class HuggingFaceChatLLM:
 class QueryGenerationLLM(HuggingFaceChatLLM):
     """Driver for generating retrieval evaluation queries and qrels."""
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(QUERY_GENERATION_MODEL_ID, **kwargs)
+    def __init__(self, model_id: str = QUERY_GENERATION_MODEL_ID, **kwargs: Any) -> None:
+        super().__init__(model_id, **kwargs)
 
     def generate_query_record(
         self,
         chunk: Mapping[str, Any],
         *,
         prompt_version: str = "v1",
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 768,
     ) -> str:
         system_prompt = (
-            "You generate realistic retrieval evaluation queries from public archive "
-            "chunks. Return one strict JSON object and do not add commentary."
+            "You generate high-quality retrieval evaluation qrels from public archive "
+            "content. Your job is to create realistic user information needs, not "
+            "quiz questions about a supplied passage. The qrel must be grounded only "
+            "in the provided chunk metadata and masked text. Return exactly one valid "
+            "JSON object. Do not wrap it in Markdown. Do not add commentary."
         )
         user_prompt = (
-            "Create one retrieval query record from this public archive chunk.\n"
-            "The query must be answerable from the chunk, must not mention 'chunk', "
-            "'passage', or 'document', and must avoid inventing facts.\n\n"
-            "Return keys: query, expected_relevant_information, reference_answer, "
-            "query_type, difficulty.\n\n"
+            "Create one retrieval query/qrel record from this public archive item.\n\n"
+            "Evaluation purpose:\n"
+            "- The query will later be used to compare dense, sparse, hybrid, and graph-enhanced retrieval.\n"
+            "- The source chunk is one known relevant result, but other chunks may also be "
+            "relevant if they contain the same expected information.\n\n"
+            "Strict grounding rules:\n"
+            "- Use only facts supported by the provided metadata and masked_text.\n"
+            "- Do not invent names, dates, locations, relationships, conclusions, or causes.\n"
+            "- Do not use raw/unmasked text if it is not present.\n"
+            "- If the text is too noisy, too short, metadata-only, or not answerable, return "
+            "a JSON object with reject=true and explain why.\n\n"
+            "Query quality rules:\n"
+            "- Write a natural user query that someone might type into an archive search system.\n"
+            "- The query must be answerable from the provided text.\n"
+            "- The query must not mention 'chunk', 'passage', 'document', 'metadata', "
+            "'excerpt', 'provided text', or similar source-framing words.\n"
+            "- Prefer queries that require useful retrieval signals: entities, events, "
+            "relationships, temporal context, aliases, or wording that is not just a long "
+            "copy of the source sentence.\n"
+            "- Avoid overly broad prompts such as 'What happened?' or 'Summarize this'.\n"
+            "- Avoid yes/no questions unless the expected information is specific.\n\n"
+            "Output schema:\n"
+            "{\n"
+            "  \"reject\": false,\n"
+            "  \"query\": \"...\",\n"
+            "  \"expected_relevant_information\": \"The minimal information a retrieved chunk must contain to be relevant.\",\n"
+            "  \"reference_answer\": \"A concise answer grounded in the source text.\",\n"
+            "  \"query_type\": \"one allowed query type\",\n"
+            "  \"difficulty\": \"easy|medium|hard\",\n"
+            "  \"grounding_evidence\": \"Short source-supported phrase or sentence fragment, not a long quote.\",\n"
+            "  \"quality_notes\": \"Brief note on why this is a good retrieval query.\"\n"
+            "}\n\n"
+            "Allowed query_type values:\n"
+            f"{json.dumps(QUERY_GENERATION_ALLOWED_QUERY_TYPES)}\n\n"
+            "Allowed difficulty values:\n"
+            f"{json.dumps(QUERY_GENERATION_ALLOWED_DIFFICULTIES)}\n\n"
+            "If rejecting, use this schema:\n"
+            "{\n"
+            "  \"reject\": true,\n"
+            "  \"rejection_reason\": \"...\",\n"
+            "  \"query\": \"\",\n"
+            "  \"expected_relevant_information\": \"\",\n"
+            "  \"reference_answer\": \"\",\n"
+            "  \"query_type\": \"\",\n"
+            "  \"difficulty\": \"\",\n"
+            "  \"grounding_evidence\": \"\",\n"
+            "  \"quality_notes\": \"\"\n"
+            "}\n\n"
             f"Prompt version: {prompt_version}\n"
-            f"Chunk metadata: {json.dumps(dict(chunk), ensure_ascii=False)[:12000]}"
+            f"Chunk metadata and masked text:\n{json.dumps(dict(chunk), ensure_ascii=False)[:12000]}"
         )
         return self.prompt(system_prompt, user_prompt, max_new_tokens=max_new_tokens)
 
@@ -165,8 +223,8 @@ class QueryGenerationLLM(HuggingFaceChatLLM):
 class RelevanceJudgeLLM(HuggingFaceChatLLM):
     """Driver for judging retrieved chunks against generated qrels."""
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(RELEVANCE_JUDGE_MODEL_ID, **kwargs)
+    def __init__(self, model_id: str = RELEVANCE_JUDGE_MODEL_ID, **kwargs: Any) -> None:
+        super().__init__(model_id, **kwargs)
 
     def judge_relevance(
         self,
@@ -174,14 +232,41 @@ class RelevanceJudgeLLM(HuggingFaceChatLLM):
         expected_relevant_information: str,
         retrieved_chunk_text: str,
         *,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 384,
     ) -> str:
         system_prompt = (
-            "You are a strict retrieval evaluator. Return one JSON object with "
-            "relevance_score from 0 to 3 and a short rationale."
+            "You are a strict retrieval evaluator for an archive search system. "
+            "Judge only retrieval relevance: whether the retrieved chunk contains "
+            "information that satisfies the query. Do not judge writing style or "
+            "whether the final answer is beautifully phrased. Return exactly one "
+            "valid JSON object. Do not wrap it in Markdown. Do not add commentary."
         )
         user_prompt = (
-            "Judge whether the retrieved chunk satisfies the query.\n\n"
+            "Judge whether the retrieved chunk satisfies the query and contains the "
+            "expected relevant information.\n\n"
+            "Relevance rubric:\n"
+            "3 = Perfectly relevant: directly answers the query and contains the expected information.\n"
+            "2 = Highly relevant: contains useful answer information, but it is incomplete, indirect, "
+            "or mixed with extraneous content.\n"
+            "1 = Related: about the same topic, entity, event, or context, but does not answer the query.\n"
+            "0 = Irrelevant: does not provide useful information for the query.\n\n"
+            "Judging rules:\n"
+            "- Base the score only on the retrieved chunk text below.\n"
+            "- Do not reward a chunk merely because it shares a dataset, title, entity name, or broad topic.\n"
+            "- Give score 3 only when the expected information is explicitly present or unambiguously entailed.\n"
+            "- Give score 2 when the chunk would help answer the query but misses part of the expected information.\n"
+            "- Give score 1 when it is topically related but cannot answer the query.\n"
+            "- Give score 0 when it is unrelated or too vague/noisy to support the query.\n"
+            "- If the retrieved text contains masked/redacted spans, judge the visible evidence only.\n\n"
+            "Return this JSON schema:\n"
+            "{\n"
+            "  \"relevance_score\": 0,\n"
+            "  \"relevance_label\": \"irrelevant|related|highly_relevant|perfectly_relevant\",\n"
+            "  \"contains_expected_information\": false,\n"
+            "  \"missing_information\": \"What is missing, or empty string if nothing is missing.\",\n"
+            "  \"supporting_evidence\": \"Short evidence from the retrieved chunk, or empty string.\",\n"
+            "  \"rationale\": \"One concise explanation of the score.\"\n"
+            "}\n\n"
             f"Query: {query}\n\n"
             f"Expected relevant information: {expected_relevant_information}\n\n"
             f"Retrieved chunk:\n{retrieved_chunk_text[:12000]}"
