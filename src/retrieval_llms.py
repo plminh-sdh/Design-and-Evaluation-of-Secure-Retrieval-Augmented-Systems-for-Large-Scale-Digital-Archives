@@ -50,11 +50,25 @@ class HuggingFaceChatLLM:
         device_map: str | Mapping[str, Any] = "auto",
         torch_dtype: str | torch.dtype = "auto",
         load_in_4bit: bool = False,
+        require_cuda: bool = False,
+        allow_cpu_offload: bool = False,
         generation_config: GenerationConfig | None = None,
     ) -> None:
         self.model_id = model_id
         self.token = token or os.getenv("HUGGING_FACE_TOKEN")
         self.generation_config = generation_config or GenerationConfig()
+
+        if require_cuda and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is required for this LLM, but torch.cuda.is_available() is False. "
+                "Reinstall a CUDA-enabled PyTorch build and restart the kernel."
+            )
+
+        if require_cuda and load_in_4bit and device_map == "auto":
+            # bitsandbytes 4-bit modules should stay on GPU. With a small GPU,
+            # device_map="auto" may try CPU/disk offload and fail before our
+            # post-load device checks can run.
+            device_map = {"": 0}
 
         if self.token:
             login(token=self.token, add_to_git_credential=False)
@@ -97,9 +111,60 @@ class HuggingFaceChatLLM:
             raise
         self.model.eval()
 
+        if require_cuda:
+            self._assert_cuda_dispatch(allow_cpu_offload=allow_cpu_offload)
+
     @property
     def device(self) -> str:
         return str(getattr(self.model, "device", "device_map:auto"))
+
+    @property
+    def device_map(self) -> Mapping[str, Any] | None:
+        return getattr(self.model, "hf_device_map", None)
+
+    def device_summary(self) -> dict[str, Any]:
+        device_map = self.device_map
+        if not device_map:
+            return {
+                "model_id": self.model_id,
+                "device": self.device,
+                "hf_device_map": None,
+                "has_cpu_or_disk_offload": self.device in {"cpu", "disk"},
+            }
+
+        devices = sorted({str(device) for device in device_map.values()})
+        return {
+            "model_id": self.model_id,
+            "device": self.device,
+            "hf_device_map": dict(device_map),
+            "devices": devices,
+            "has_cpu_or_disk_offload": any(
+                device in {"cpu", "disk"} for device in devices
+            ),
+        }
+
+    def _assert_cuda_dispatch(self, *, allow_cpu_offload: bool) -> None:
+        summary = self.device_summary()
+        device_map = summary.get("hf_device_map")
+        has_cpu_or_disk_offload = bool(summary.get("has_cpu_or_disk_offload"))
+
+        if device_map:
+            devices = {str(device) for device in device_map.values()}
+            has_cuda = any(device.startswith(("cuda", "0")) for device in devices)
+        else:
+            has_cuda = str(summary.get("device", "")).startswith("cuda")
+
+        if not has_cuda:
+            raise RuntimeError(
+                f"{self.model_id} was not dispatched to CUDA. Device summary: {summary}"
+            )
+
+        if has_cpu_or_disk_offload and not allow_cpu_offload:
+            raise RuntimeError(
+                f"{self.model_id} was partially offloaded to CPU/disk. "
+                f"Device summary: {summary}. Use 4-bit quantization, a smaller model, "
+                "or allow_cpu_offload=True if slow CPU/disk offload is acceptable."
+            )
 
     def chat(
         self,
@@ -157,6 +222,9 @@ class QueryGenerationLLM(HuggingFaceChatLLM):
         *,
         prompt_version: str = "v1",
         max_new_tokens: int = 768,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        do_sample: bool | None = None,
     ) -> str:
         system_prompt = (
             "You generate high-quality retrieval evaluation qrels from public archive "
@@ -187,6 +255,14 @@ class QueryGenerationLLM(HuggingFaceChatLLM):
             "copy of the source sentence.\n"
             "- Avoid overly broad prompts such as 'What happened?' or 'Summarize this'.\n"
             "- Avoid yes/no questions unless the expected information is specific.\n\n"
+            "Expected-information rules:\n"
+            "- expected_relevant_information must be self-contained and include the core "
+            "entity, event, relationship, or topic from the query.\n"
+            "- Do not write only a bare value such as a year, name, or location.\n"
+            "- Good: 'The Riverside Public Library opened its digital archive in 2024.'\n"
+            "- Bad: 'The year 2024.'\n"
+            "- The reference_answer may be shorter, but expected_relevant_information must "
+            "state what the answer is about.\n\n"
             "Output schema:\n"
             "{\n"
             "  \"reject\": false,\n"
@@ -217,7 +293,14 @@ class QueryGenerationLLM(HuggingFaceChatLLM):
             f"Prompt version: {prompt_version}\n"
             f"Chunk metadata and masked text:\n{json.dumps(dict(chunk), ensure_ascii=False)[:12000]}"
         )
-        return self.prompt(system_prompt, user_prompt, max_new_tokens=max_new_tokens)
+        return self.prompt(
+            system_prompt,
+            user_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
 
 
 class RelevanceJudgeLLM(HuggingFaceChatLLM):
