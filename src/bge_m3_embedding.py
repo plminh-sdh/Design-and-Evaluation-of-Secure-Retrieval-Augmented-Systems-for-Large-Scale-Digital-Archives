@@ -13,6 +13,36 @@ from src.archive_schema import ArchiveChunk, archive_chunk_to_qdrant_payload
 
 BGE_M3_MODEL_NAME = "BAAI/bge-m3"
 BGE_M3_DENSE_VECTOR_SIZE = 1024
+_TRANSFORMERS_DTYPE_PATCHED = False
+
+
+def _patch_transformers_dtype_argument() -> None:
+    """Compat patch for FlagEmbedding versions that pass dtype= to Transformers.
+
+    FlagEmbedding 1.4.0 calls AutoModel.from_pretrained(..., dtype=...).
+    Transformers 4.51.x still expects torch_dtype=..., so XLMRobertaModel sees an
+    unexpected dtype keyword. This local patch translates the keyword at the
+    AutoModel boundary without modifying site-packages.
+    """
+
+    global _TRANSFORMERS_DTYPE_PATCHED
+    if _TRANSFORMERS_DTYPE_PATCHED:
+        return
+
+    try:
+        from transformers import AutoModel
+    except ImportError:
+        return
+
+    original_from_pretrained = AutoModel.from_pretrained
+
+    def from_pretrained_with_dtype_compat(*args: Any, **kwargs: Any) -> Any:
+        if "dtype" in kwargs and "torch_dtype" not in kwargs:
+            kwargs["torch_dtype"] = kwargs.pop("dtype")
+        return original_from_pretrained(*args, **kwargs)
+
+    AutoModel.from_pretrained = from_pretrained_with_dtype_compat
+    _TRANSFORMERS_DTYPE_PATCHED = True
 
 
 @dataclass
@@ -41,6 +71,7 @@ class BGEM3Embedder:
         device: Optional[str] = None,
         require_cuda: bool = False,
     ) -> None:
+        _patch_transformers_dtype_argument()
         try:
             from FlagEmbedding import BGEM3FlagModel
         except ImportError as exc:
@@ -52,7 +83,7 @@ class BGEM3Embedder:
         resolved_device = self._resolve_device(device, require_cuda=require_cuda)
         model_kwargs: Dict[str, Any] = {"use_fp16": use_fp16}
         if resolved_device:
-            model_kwargs["device"] = resolved_device
+            model_kwargs["devices"] = resolved_device
 
         self.model_name = model_name
         self.device = resolved_device or "auto"
