@@ -349,9 +349,11 @@ class OpenAIRelevanceJudgeLLM:
         *,
         api_key: str | None = None,
         env_path: str = ".env",
+        reasoning_effort: str | None = "minimal",
         **_: Any,
     ) -> None:
         self.model_id = model_id
+        self.reasoning_effort = reasoning_effort
         self.api_key = api_key or self._load_api_key(env_path=env_path)
         if not self.api_key:
             raise ValueError(
@@ -399,7 +401,41 @@ class OpenAIRelevanceJudgeLLM:
             "device": self.device,
             "has_cpu_or_disk_offload": False,
             "api_key_configured": bool(self.api_key),
+            "reasoning_effort": self.reasoning_effort,
         }
+
+    @staticmethod
+    def _response_to_text(response: Any) -> str:
+        """Extract assistant text robustly across OpenAI SDK response shapes."""
+
+        output_text = str(getattr(response, "output_text", "") or "").strip()
+        if output_text:
+            return output_text
+
+        text_parts: list[str] = []
+        for output_item in getattr(response, "output", []) or []:
+            for content_item in getattr(output_item, "content", []) or []:
+                text = getattr(content_item, "text", None)
+                if text:
+                    text_parts.append(str(text))
+                elif isinstance(content_item, dict) and content_item.get("text"):
+                    text_parts.append(str(content_item["text"]))
+
+        extracted_text = "\n".join(part.strip() for part in text_parts if part).strip()
+        if extracted_text:
+            return extracted_text
+
+        status = getattr(response, "status", "")
+        incomplete_details = getattr(response, "incomplete_details", None)
+        try:
+            response_dump = response.model_dump_json(indent=2)
+        except Exception:
+            response_dump = repr(response)
+        raise RuntimeError(
+            "OpenAI relevance judge returned no text. "
+            f"status={status!r}, incomplete_details={incomplete_details!r}, "
+            f"raw_response={response_dump[:4000]}"
+        )
 
     def judge_relevance(
         self,
@@ -408,7 +444,7 @@ class OpenAIRelevanceJudgeLLM:
         retrieved_chunk_text: str,
         *,
         max_new_tokens: int = 128,
-        temperature: float | None = 0.0,
+        temperature: float | None = None,
         top_p: float | None = 1.0,
         do_sample: bool | None = False,
     ) -> str:
@@ -449,6 +485,9 @@ class OpenAIRelevanceJudgeLLM:
             f"Expected relevant information: {expected_relevant_information}\n\n"
             f"Retrieved chunk:\n{retrieved_chunk_text[:12000]}"
         )
+        # GPT-5 reasoning models may spend output budget on hidden reasoning
+        # before emitting visible JSON. Keep a practical floor for smoke tests.
+        resolved_max_output_tokens = max(int(max_new_tokens or 0), 512)
         request = {
             "model": self.model_id,
             "input": [
@@ -494,8 +533,10 @@ class OpenAIRelevanceJudgeLLM:
                     "strict": True,
                 }
             },
-            "max_output_tokens": max_new_tokens,
+            "max_output_tokens": resolved_max_output_tokens,
         }
+        if self.reasoning_effort:
+            request["reasoning"] = {"effort": self.reasoning_effort}
         if temperature is not None:
             request["temperature"] = temperature
         if top_p is not None:
@@ -505,12 +546,20 @@ class OpenAIRelevanceJudgeLLM:
             response = self.client.responses.create(**request)
         except Exception as exc:
             message = str(exc).lower()
-            if "temperature" not in message and "top_p" not in message:
+            if (
+                "temperature" not in message
+                and "top_p" not in message
+                and "reasoning" not in message
+            ):
                 raise
-            request.pop("temperature", None)
-            request.pop("top_p", None)
+            if "temperature" in message:
+                request.pop("temperature", None)
+            if "top_p" in message:
+                request.pop("top_p", None)
+            if "reasoning" in message:
+                request.pop("reasoning", None)
             response = self.client.responses.create(**request)
-        return response.output_text.strip()
+        return self._response_to_text(response)
 
 
 RelevanceJudgeLLM = OpenAIRelevanceJudgeLLM

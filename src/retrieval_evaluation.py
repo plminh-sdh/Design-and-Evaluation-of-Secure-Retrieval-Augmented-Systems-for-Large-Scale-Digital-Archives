@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -104,9 +105,29 @@ def _judgment_cache_key(
     *,
     query_id: str,
     chunk_id: str,
+    judge_model_id: str,
+) -> str:
+    """Stable cache key for deterministic query/chunk judgment reuse."""
+
+    raw = "|".join(
+        [
+            str(query_id),
+            str(chunk_id),
+            str(judge_model_id),
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _legacy_judgment_cache_key(
+    *,
+    query_id: str,
+    chunk_id: str,
     expected_relevant_information: str,
     judge_model_id: str,
 ) -> str:
+    """Previous cache key shape kept so old judgment files remain reusable."""
+
     raw = "|".join(
         [
             str(query_id),
@@ -125,7 +146,21 @@ def load_judgment_cache(path: str | Path) -> dict[str, dict[str, Any]]:
     for record in read_jsonl(path):
         key = str(record.get("judgment_key", ""))
         if key:
-            cache[key] = record
+            cache.setdefault(key, record)
+
+        query_id = str(record.get("query_id", ""))
+        chunk_id = str(record.get("chunk_id", ""))
+        judge_model_id = str(record.get("judge_model", ""))
+        if query_id and chunk_id and judge_model_id:
+            stable_key = _judgment_cache_key(
+                query_id=query_id,
+                chunk_id=chunk_id,
+                judge_model_id=judge_model_id,
+            )
+            stable_record = dict(record)
+            stable_record["judgment_key"] = stable_key
+            stable_record["cache_key_version"] = "query_chunk_v1"
+            cache.setdefault(stable_key, stable_record)
     return cache
 
 
@@ -137,6 +172,8 @@ def judge_retrieval_results(
     output_jsonl: str | Path | None = None,
     resume: bool = True,
     max_new_tokens: int = 256,
+    max_retries: int = 5,
+    retry_sleep_seconds: float = 2.0,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Judge retrieved chunks with the relevance-judge LLM.
@@ -171,39 +208,72 @@ def judge_retrieval_results(
         judgment_key = _judgment_cache_key(
             query_id=query_id,
             chunk_id=chunk_id,
+            judge_model_id=judge_model_id,
+        )
+        legacy_judgment_key = _legacy_judgment_cache_key(
+            query_id=query_id,
+            chunk_id=chunk_id,
             expected_relevant_information=expected,
             judge_model_id=judge_model_id,
         )
 
-        cached_record = cache.get(judgment_key)
+        cached_record = cache.get(judgment_key) or cache.get(legacy_judgment_key)
         if cached_record:
+            cached_record = dict(cached_record)
+            cached_record["judgment_key"] = judgment_key
+            cached_record["cache_key_version"] = "query_chunk_v1"
             judged_records.append(cached_record)
             iterator.set_postfix(cached=len(judged_records), new=len(new_records))
             continue
 
-        raw_response = judge_llm.judge_relevance(
-            query=str(result.get("query", qrel.get("query", ""))),
-            expected_relevant_information=expected,
-            retrieved_chunk_text=str(result.get("retrieval_text", "")),
-            max_new_tokens=max_new_tokens,
-        )
+        raw_response = ""
+        last_error: Exception | None = None
+        query_text = str(result.get("query", qrel.get("query", "")))
+        retrieved_chunk_text = str(result.get("retrieval_text", ""))
+        for attempt in range(1, max(max_retries, 1) + 1):
+            try:
+                raw_response = judge_llm.judge_relevance(
+                    query=query_text,
+                    expected_relevant_information=expected,
+                    retrieved_chunk_text=retrieved_chunk_text,
+                    max_new_tokens=max_new_tokens,
+                )
+                if str(raw_response).strip():
+                    break
+                last_error = ValueError("Judge returned an empty response.")
+            except Exception as exc:
+                last_error = exc
+
+            if attempt < max(max_retries, 1):
+                if verbose:
+                    tqdm.write(
+                        "Retrying judge call after empty/error response "
+                        f"({attempt}/{max_retries}) for query_id={query_id}, "
+                        f"chunk_id={chunk_id}: {last_error!r}"
+                    )
+                time.sleep(retry_sleep_seconds * attempt)
+
         try:
             parsed = extract_first_json_object(raw_response)
             relevance_score = int(parsed.get("relevance_score", 0))
         except Exception as exc:
             parsed = {
                 "relevance_score": 0,
-                "relevance_label": "parse_error",
+                "relevance_label": "judge_error",
                 "contains_expected_information": False,
                 "missing_information": "",
                 "supporting_evidence": "",
-                "rationale": f"Judge response parse error: {exc!r}",
+                "rationale": (
+                    "Judge response failed after retries. "
+                    f"last_error={last_error!r}; parse_error={exc!r}"
+                ),
             }
             relevance_score = 0
 
         relevance_score = max(0, min(3, relevance_score))
         record = {
             "judgment_key": judgment_key,
+            "cache_key_version": "query_chunk_v1",
             "query_id": query_id,
             "query": result.get("query", qrel.get("query", "")),
             "source_chunk_id": qrel.get("source_chunk_id", ""),
@@ -214,6 +284,8 @@ def judge_retrieval_results(
             "expected_relevant_information": expected,
             "is_source_chunk": chunk_id == str(qrel.get("source_chunk_id", "")),
             "judge_model": judge_model_id,
+            "judge_attempts": attempt,
+            "judge_error": repr(last_error) if last_error and not str(raw_response).strip() else "",
             "raw_judge_response": raw_response,
             **parsed,
             "relevance_score": relevance_score,
@@ -303,4 +375,3 @@ def summarize_retrieval_judgments(
         )
 
     return pd.DataFrame(rows)
-
