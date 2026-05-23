@@ -154,6 +154,51 @@ class QdrantRetrievalDriver:
         )
         return list(response.points)
 
+    def search_hybrid_rrf(
+        self,
+        *,
+        dense_query_vector: Sequence[float],
+        sparse_query_vector: models.SparseVector,
+        dense_vector_name: str = "dense",
+        sparse_vector_name: str = "sparse",
+        top_k: int,
+        prefetch_limit: int | None = None,
+        query_filter: Any | None = None,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        rrf_k: int | None = None,
+    ) -> list[Any]:
+        """Search dense+sparse vectors with Qdrant's server-side RRF fusion."""
+
+        prefetch_limit = prefetch_limit or max(top_k, 20)
+        if rrf_k is None:
+            query = models.RrfQuery(rrf=models.Rrf())
+        else:
+            query = models.RrfQuery(rrf=models.Rrf(k=rrf_k))
+
+        response = self.client.query_points(
+            collection_name=self.collection_name,
+            prefetch=[
+                models.Prefetch(
+                    query=sparse_query_vector,
+                    using=sparse_vector_name,
+                    limit=prefetch_limit,
+                    filter=query_filter,
+                ),
+                models.Prefetch(
+                    query=list(dense_query_vector),
+                    using=dense_vector_name,
+                    limit=prefetch_limit,
+                    filter=query_filter,
+                ),
+            ],
+            query=query,
+            limit=top_k,
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+        )
+        return list(response.points)
+
 
 @dataclass(frozen=True)
 class Neo4jGraphRetrievalDriver:
