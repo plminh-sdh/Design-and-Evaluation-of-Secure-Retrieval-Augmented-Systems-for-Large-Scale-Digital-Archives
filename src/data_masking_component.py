@@ -52,6 +52,11 @@ TAB_SPLIT_ARCHIVES = {
     "dev": "echr_dev.zip",
     "test": "echr_test.zip",
 }
+DATABASE_STYLE_GLINER_MAX_WORDS = 350
+DATABASE_STYLE_GLINER_OVERLAP_WORDS = 60
+DATABASE_STYLE_GLINER_STRIDE_WORDS = (
+    DATABASE_STYLE_GLINER_MAX_WORDS - DATABASE_STYLE_GLINER_OVERLAP_WORDS
+)
 
 
 def safe_json_dumps(value: Any) -> str:
@@ -892,6 +897,19 @@ def move_model_to_cuda_if_available(model: Any) -> Any:
     return model
 
 
+def move_model_to_device(model: Any, device: str | None) -> Any:
+    """Move a model-like object to an explicit device when possible."""
+
+    if device is None:
+        return move_model_to_cuda_if_available(model)
+    try:
+        if hasattr(model, "to"):
+            return model.to(device)
+    except Exception:
+        pass
+    return model
+
+
 def _stable_masking_id(*parts: Any) -> str:
     import hashlib
 
@@ -952,6 +970,50 @@ def _mention_gold_target(
         best_overlap = overlap
         best_target = 1 if _is_sensitive_identifier(mention.get("identifier_type")) else 0
     return best_target
+
+
+def database_style_word_windows(
+    text: str,
+    *,
+    max_words: int = DATABASE_STYLE_GLINER_MAX_WORDS,
+    overlap_words: int = DATABASE_STYLE_GLINER_OVERLAP_WORDS,
+) -> list[dict[str, Any]]:
+    """Split text like Database.ipynb archive chunks while preserving offsets."""
+
+    tokens, offsets = tokenize_with_offsets(text)
+    if not tokens:
+        return []
+    max_words = max(1, int(max_words))
+    overlap_words = max(0, min(int(overlap_words), max_words - 1))
+    stride = max_words - overlap_words
+
+    windows: list[dict[str, Any]] = []
+    start_token = 0
+    window_index = 0
+    while start_token < len(tokens):
+        end_token = min(len(tokens), start_token + max_words)
+        char_start = offsets[start_token][0]
+        char_end = offsets[end_token - 1][1]
+        windows.append(
+            {
+                "window_index": window_index,
+                "start_token": start_token,
+                "end_token": end_token,
+                "char_start": char_start,
+                "char_end": char_end,
+                "tokens": tokens[start_token:end_token],
+                "offsets": [
+                    (start - char_start, end - char_start)
+                    for start, end in offsets[start_token:end_token]
+                ],
+                "text": text[char_start:char_end],
+            }
+        )
+        if end_token >= len(tokens):
+            break
+        start_token += stride
+        window_index += 1
+    return windows
 
 
 def _gold_sensitive_spans(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1063,11 +1125,14 @@ def predict_gliner_mentions_for_records(
     labels: Sequence[str],
     *,
     threshold: float = 0.3,
+    gliner_device: str | None = None,
+    max_words: int = DATABASE_STYLE_GLINER_MAX_WORDS,
+    overlap_words: int = DATABASE_STYLE_GLINER_OVERLAP_WORDS,
     verbose: bool = True,
 ) -> list[dict[str, Any]]:
-    """Run GLiNER over TAB chunks and return normalized span predictions."""
+    """Run GLiNER over Database.ipynb-style word windows."""
 
-    gliner_model = move_model_to_cuda_if_available(gliner_model)
+    gliner_model = move_model_to_device(gliner_model, gliner_device)
     predictions: list[dict[str, Any]] = []
     for row in tqdm(
         records_df.to_dict(orient="records"),
@@ -1079,34 +1144,55 @@ def predict_gliner_mentions_for_records(
         chunk_id = str(row.get("chunk_id") or "")
         if not text.strip() or not chunk_id:
             continue
-        raw_predictions = gliner_model.predict_entities(
-            text,
-            list(labels),
-            threshold=threshold,
-        )
         gold_mentions = _gold_mentions_for_row(row)
-        for index, prediction in enumerate(raw_predictions or []):
-            start = _coerce_int(prediction.get("start"))
-            end = _coerce_int(prediction.get("end"))
-            if start < 0 or end <= start:
-                continue
-            label = str(prediction.get("label") or "")
-            score = float(prediction.get("score") or 0.0)
-            record = {
-                "prediction_id": _stable_masking_id(chunk_id, start, end, label, index),
-                "chunk_id": chunk_id,
-                "document_id": row.get("document_id"),
-                "text": text[start:end],
-                "start": start,
-                "end": end,
-                "label": label,
-                "score": score,
-                "gold_target": _mention_gold_target(
-                    {"start": start, "end": end},
-                    gold_mentions,
-                ),
-            }
-            predictions.append(record)
+        seen_predictions: set[tuple[int, int, str]] = set()
+        windows = database_style_word_windows(
+            text,
+            max_words=max_words,
+            overlap_words=overlap_words,
+        )
+        for window in windows:
+            raw_predictions = gliner_model.predict_entities(
+                str(window["text"]),
+                list(labels),
+                threshold=threshold,
+            )
+            for index, prediction in enumerate(raw_predictions or []):
+                start = _coerce_int(prediction.get("start")) + int(window["char_start"])
+                end = _coerce_int(prediction.get("end")) + int(window["char_start"])
+                if start < 0 or end <= start or end > len(text):
+                    continue
+                label = str(prediction.get("label") or "")
+                dedupe_key = (start, end, label)
+                if dedupe_key in seen_predictions:
+                    continue
+                seen_predictions.add(dedupe_key)
+                score = float(prediction.get("score") or 0.0)
+                record = {
+                    "prediction_id": _stable_masking_id(
+                        chunk_id,
+                        start,
+                        end,
+                        label,
+                        int(window["window_index"]),
+                        index,
+                    ),
+                    "chunk_id": chunk_id,
+                    "document_id": row.get("document_id"),
+                    "text": text[start:end],
+                    "start": start,
+                    "end": end,
+                    "label": label,
+                    "score": score,
+                    "window_index": int(window["window_index"]),
+                    "window_start_token": int(window["start_token"]),
+                    "window_end_token": int(window["end_token"]) - 1,
+                    "gold_target": _mention_gold_target(
+                        {"start": start, "end": end},
+                        gold_mentions,
+                    ),
+                }
+                predictions.append(record)
     return predictions
 
 
@@ -1117,6 +1203,9 @@ def train_policy_gliner_masking_strategy(
     output_json: str | Path,
     *,
     gliner_threshold: float = 0.3,
+    gliner_device: str | None = None,
+    max_words: int = DATABASE_STYLE_GLINER_MAX_WORDS,
+    overlap_words: int = DATABASE_STYLE_GLINER_OVERLAP_WORDS,
     tune_thresholds: Sequence[float] | None = None,
     force_retrain: bool = False,
     verbose: bool = True,
@@ -1137,6 +1226,9 @@ def train_policy_gliner_masking_strategy(
         policy_gliner_model,
         labels,
         threshold=gliner_threshold,
+        gliner_device=gliner_device,
+        max_words=max_words,
+        overlap_words=overlap_words,
         verbose=verbose,
     )
     predictions_by_chunk: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1162,6 +1254,9 @@ def train_policy_gliner_masking_strategy(
     result = {
         "strategy": "policy_gliner_alone",
         "gliner_threshold": float(gliner_threshold),
+        "gliner_device": gliner_device or "auto",
+        "max_words": int(max_words),
+        "overlap_words": int(overlap_words),
         "objective": "maximize_detection_f1_or_minimize_1_minus_f1",
         "best": tuning["best"],
         "metrics_by_threshold": tuning["metrics_by_threshold"],
@@ -1178,15 +1273,21 @@ def build_gliner_predictions_for_glirel(
     *,
     label_mode: str = "semantic",
     gliner_threshold: float = 0.3,
+    gliner_device: str | None = None,
+    max_words: int = DATABASE_STYLE_GLINER_MAX_WORDS,
+    overlap_words: int = DATABASE_STYLE_GLINER_OVERLAP_WORDS,
     verbose: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Run GLiNER and convert predictions into consistent GLiREL inputs."""
+    """Run GLiNER and convert predictions into Database-style GLiREL windows."""
 
     predictions = predict_gliner_mentions_for_records(
         records_df,
         gliner_model,
         labels,
         threshold=gliner_threshold,
+        gliner_device=gliner_device,
+        max_words=max_words,
+        overlap_words=overlap_words,
         verbose=verbose,
     )
     rows_by_chunk = {
@@ -1216,44 +1317,70 @@ def build_gliner_predictions_for_glirel(
         if row is None or len(chunk_predictions) < 2:
             continue
         text = _as_text(row.get("raw_text"))
-        tokens, offsets = tokenize_with_offsets(text)
-        if not tokens:
-            continue
-        ner: list[list[Any]] = []
-        mention_records: list[dict[str, Any]] = []
-        for prediction in sorted(chunk_predictions, key=lambda item: (int(item["start"]), int(item["end"]))):
-            token_span = char_span_to_token_span(
-                offsets,
-                int(prediction["start"]),
-                int(prediction["end"]),
-            )
-            if token_span is None:
-                continue
-            start_token, end_token = token_span
-            mention_record = dict(prediction)
-            mention_record["mention_id"] = prediction["prediction_id"]
-            mention_record["mention_text"] = prediction["text"]
-            mention_record["token_start"] = start_token
-            mention_record["token_end"] = end_token
-            mention_record["ner_index"] = len(ner)
-            mention_records.append(mention_record)
-            ner.append([start_token, end_token, mention_record["mention_type"], prediction["text"]])
-        if len(ner) < 2:
-            continue
-        glirel_inputs.append(
-            {
-                "input_id": _stable_masking_id("masking_glirel", chunk_id, len(ner)),
-                "chunk_id": chunk_id,
-                "document_id": row.get("document_id"),
-                "dataset": row.get("dataset", TAB_DATASET_LABEL),
-                "modality": row.get("modality", TAB_MODALITY),
-                "text": text,
-                "tokens": tokens,
-                "ner": ner,
-                "mention_records": mention_records,
-                "labels": list(MASKING_GLIREL_DEFAULT_LABELS),
-            }
+        windows = database_style_word_windows(
+            text,
+            max_words=max_words,
+            overlap_words=overlap_words,
         )
+        if not windows:
+            continue
+        for window in windows:
+            window_char_start = int(window["char_start"])
+            window_char_end = int(window["char_end"])
+            window_predictions = [
+                prediction
+                for prediction in chunk_predictions
+                if int(prediction["start"]) >= window_char_start
+                and int(prediction["end"]) <= window_char_end
+            ]
+            if len(window_predictions) < 2:
+                continue
+
+            ner: list[list[Any]] = []
+            mention_records: list[dict[str, Any]] = []
+            for prediction in sorted(window_predictions, key=lambda item: (int(item["start"]), int(item["end"]))):
+                local_start = int(prediction["start"]) - window_char_start
+                local_end = int(prediction["end"]) - window_char_start
+                token_span = char_span_to_token_span(
+                    window["offsets"],
+                    local_start,
+                    local_end,
+                )
+                if token_span is None:
+                    continue
+                start_token, end_token = token_span
+                mention_record = dict(prediction)
+                mention_record["mention_id"] = prediction["prediction_id"]
+                mention_record["mention_text"] = prediction["text"]
+                mention_record["token_start"] = start_token
+                mention_record["token_end"] = end_token
+                mention_record["ner_index"] = len(ner)
+                mention_records.append(mention_record)
+                ner.append([start_token, end_token, mention_record["mention_type"], prediction["text"]])
+            if len(ner) < 2:
+                continue
+            glirel_inputs.append(
+                {
+                    "input_id": _stable_masking_id(
+                        "masking_glirel",
+                        chunk_id,
+                        int(window["window_index"]),
+                        len(ner),
+                    ),
+                    "chunk_id": chunk_id,
+                    "document_id": row.get("document_id"),
+                    "dataset": row.get("dataset", TAB_DATASET_LABEL),
+                    "modality": row.get("modality", TAB_MODALITY),
+                    "text": window["text"],
+                    "tokens": window["tokens"],
+                    "ner": ner,
+                    "mention_records": mention_records,
+                    "labels": list(MASKING_GLIREL_DEFAULT_LABELS),
+                    "window_index": int(window["window_index"]),
+                    "window_start_token": int(window["start_token"]),
+                    "window_end_token": int(window["end_token"]) - 1,
+                }
+            )
     return predictions, glirel_inputs
 
 
@@ -1563,6 +1690,9 @@ def train_semantic_gliner_glirel_strategy(
     *,
     relation_labels: Sequence[str] | None = None,
     gliner_threshold: float = 0.3,
+    gliner_device: str | None = None,
+    max_words: int = DATABASE_STYLE_GLINER_MAX_WORDS,
+    overlap_words: int = DATABASE_STYLE_GLINER_OVERLAP_WORDS,
     glirel_threshold: float = 0.05,
     glirel_top_k: int = 3,
     glirel_batch_size: int = 4,
@@ -1585,6 +1715,9 @@ def train_semantic_gliner_glirel_strategy(
         labels,
         label_mode="semantic",
         gliner_threshold=gliner_threshold,
+        gliner_device=gliner_device,
+        max_words=max_words,
+        overlap_words=overlap_words,
         verbose=verbose,
     )
     relation_predictions = predict_glirel_for_masking_inputs(
@@ -1644,6 +1777,9 @@ def train_semantic_gliner_glirel_strategy(
     result = {
         "strategy": "semantic_gliner_glirel_relation_weights",
         "gliner_threshold": float(gliner_threshold),
+        "gliner_device": gliner_device or "auto",
+        "max_words": int(max_words),
+        "overlap_words": int(overlap_words),
         "glirel_threshold": float(glirel_threshold),
         "glirel_top_k": int(glirel_top_k),
         "objective": "maximize_detection_f1_or_minimize_1_minus_f1",
@@ -1697,6 +1833,9 @@ def train_policy_gliner_glirel_strategy(
     *,
     relation_labels: Sequence[str] | None = None,
     gliner_threshold: float = 0.3,
+    gliner_device: str | None = None,
+    max_words: int = DATABASE_STYLE_GLINER_MAX_WORDS,
+    overlap_words: int = DATABASE_STYLE_GLINER_OVERLAP_WORDS,
     glirel_threshold: float = 0.05,
     glirel_top_k: int = 3,
     glirel_batch_size: int = 4,
@@ -1722,6 +1861,9 @@ def train_policy_gliner_glirel_strategy(
         labels,
         label_mode="policy_composite",
         gliner_threshold=gliner_threshold,
+        gliner_device=gliner_device,
+        max_words=max_words,
+        overlap_words=overlap_words,
         verbose=verbose,
     )
     relation_predictions = predict_glirel_for_masking_inputs(
@@ -1817,6 +1959,9 @@ def train_policy_gliner_glirel_strategy(
         "strategy": "policy_gliner_glirel_relation_enhancement",
         "combination_mode": combination_mode,
         "gliner_threshold": float(gliner_threshold),
+        "gliner_device": gliner_device or "auto",
+        "max_words": int(max_words),
+        "overlap_words": int(overlap_words),
         "glirel_threshold": float(glirel_threshold),
         "glirel_top_k": int(glirel_top_k),
         "objective": "maximize_detection_f1_or_minimize_1_minus_f1",
