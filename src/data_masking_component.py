@@ -1824,6 +1824,272 @@ def _combine_scores(
     return alpha * policy_score + (1 - alpha) * relation_score
 
 
+def _merged_char_length(spans: Sequence[tuple[int, int]]) -> int:
+    cleaned = sorted((int(start), int(end)) for start, end in spans if int(end) > int(start))
+    if not cleaned:
+        return 0
+    merged: list[list[int]] = []
+    for start, end in cleaned:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return sum(end - start for start, end in merged)
+
+
+def _intersection_char_length(
+    left_spans: Sequence[tuple[int, int]],
+    right_spans: Sequence[tuple[int, int]],
+) -> int:
+    intersections: list[tuple[int, int]] = []
+    for left_start, left_end in left_spans:
+        for right_start, right_end in right_spans:
+            start = max(int(left_start), int(right_start))
+            end = min(int(left_end), int(right_end))
+            if end > start:
+                intersections.append((start, end))
+    return _merged_char_length(intersections)
+
+
+def compute_masking_metrics(
+    records_df: pd.DataFrame,
+    predictions_by_chunk: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    threshold: float = 0.5,
+    score_field: str = "sensitivity_score",
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Compute the six masking metrics used for final strategy comparison.
+
+    SSR/SSP/Detection F1 are relaxed span-level detection metrics. RSTR measures
+    retained sensitive character rate, while MCR and MCR* report total and
+    non-sensitive character masking rates.
+    """
+
+    detection = evaluate_sensitive_span_predictions(
+        records_df,
+        predictions_by_chunk,
+        threshold=threshold,
+        score_field=score_field,
+        verbose=verbose,
+    )
+    sensitive_chars = 0
+    covered_sensitive_chars = 0
+    total_chars = 0
+    masked_chars = 0
+    nonsensitive_chars = 0
+    masked_nonsensitive_chars = 0
+
+    for row in records_df.to_dict(orient="records"):
+        chunk_id = str(row.get("chunk_id") or "")
+        text = _as_text(row.get("raw_text"))
+        total_chars += len(text)
+        sensitive_spans = [
+            (int(span.get("start", -1)), int(span.get("end", -1)))
+            for span in row.get("gold_sensitive_spans") or []
+        ]
+        predicted_spans = [
+            (int(prediction.get("start", -1)), int(prediction.get("end", -1)))
+            for prediction in predictions_by_chunk.get(chunk_id, [])
+            if float(prediction.get(score_field, 0.0) or 0.0) >= threshold
+        ]
+        chunk_sensitive_chars = _merged_char_length(sensitive_spans)
+        chunk_masked_chars = _merged_char_length(predicted_spans)
+        chunk_covered_sensitive_chars = _intersection_char_length(predicted_spans, sensitive_spans)
+        sensitive_chars += chunk_sensitive_chars
+        covered_sensitive_chars += chunk_covered_sensitive_chars
+        masked_chars += chunk_masked_chars
+        chunk_nonsensitive_chars = max(len(text) - chunk_sensitive_chars, 0)
+        nonsensitive_chars += chunk_nonsensitive_chars
+        masked_nonsensitive_chars += max(chunk_masked_chars - chunk_covered_sensitive_chars, 0)
+
+    ssr = detection["recall"]
+    ssp = detection["precision"]
+    detection_f1 = detection["f1"]
+    rstr = 1.0 - (covered_sensitive_chars / sensitive_chars) if sensitive_chars else 0.0
+    mcr = masked_chars / total_chars if total_chars else 0.0
+    mcr_star = masked_nonsensitive_chars / nonsensitive_chars if nonsensitive_chars else 0.0
+    return {
+        "threshold": float(threshold),
+        "tp": detection["tp"],
+        "fp": detection["fp"],
+        "fn": detection["fn"],
+        "SSR": ssr,
+        "SSP": ssp,
+        "Detection_F1": detection_f1,
+        "RSTR": rstr,
+        "MCR": mcr,
+        "MCR_star": mcr_star,
+        "loss": 1.0 - detection_f1,
+        "sensitive_chars": int(sensitive_chars),
+        "covered_sensitive_chars": int(covered_sensitive_chars),
+        "total_chars": int(total_chars),
+        "masked_chars": int(masked_chars),
+        "nonsensitive_chars": int(nonsensitive_chars),
+        "masked_nonsensitive_chars": int(masked_nonsensitive_chars),
+    }
+
+
+def evaluate_policy_gliner_strategy_on_records(
+    records_df: pd.DataFrame,
+    policy_gliner_model: Any,
+    labels: Sequence[str],
+    strategy_result: Mapping[str, Any],
+    *,
+    gliner_device: str | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Apply saved Strategy 1 settings to evaluation records."""
+
+    best = strategy_result.get("best") or {}
+    threshold = float(best.get("threshold", 0.5))
+    predictions = predict_gliner_mentions_for_records(
+        records_df,
+        policy_gliner_model,
+        labels,
+        threshold=float(strategy_result.get("gliner_threshold", 0.3)),
+        gliner_device=gliner_device or strategy_result.get("gliner_device"),
+        max_words=int(strategy_result.get("max_words", DATABASE_STYLE_GLINER_MAX_WORDS)),
+        overlap_words=int(strategy_result.get("overlap_words", DATABASE_STYLE_GLINER_OVERLAP_WORDS)),
+        verbose=verbose,
+    )
+    predictions_by_chunk: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for prediction in predictions:
+        record = dict(prediction)
+        sensitive = policy_label_is_sensitive(record.get("label"))
+        record["semantic_label"] = policy_label_semantic_type(record.get("label"))
+        record["policy_sensitive"] = bool(sensitive)
+        record["sensitivity_score"] = float(record.get("score") or 0.0) if sensitive else 0.0
+        predictions_by_chunk[str(record.get("chunk_id") or "")].append(record)
+    metrics = compute_masking_metrics(records_df, predictions_by_chunk, threshold=threshold, verbose=False)
+    return {
+        "strategy": "Policy GLiNER",
+        "threshold": threshold,
+        "metrics": metrics,
+        "predictions_by_chunk": predictions_by_chunk,
+    }
+
+
+def evaluate_semantic_gliner_glirel_strategy_on_records(
+    records_df: pd.DataFrame,
+    semantic_gliner_model: Any,
+    glirel_model: Any,
+    labels: Sequence[str],
+    strategy_result: Mapping[str, Any],
+    *,
+    relation_labels: Sequence[str] | None = None,
+    gliner_device: str | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Apply saved Strategy 2 settings to evaluation records."""
+
+    best = strategy_result.get("best") or {}
+    threshold = float(best.get("threshold", 0.5))
+    gliner_predictions, glirel_inputs = build_gliner_predictions_for_glirel(
+        records_df,
+        semantic_gliner_model,
+        labels,
+        label_mode="semantic",
+        gliner_threshold=float(strategy_result.get("gliner_threshold", 0.3)),
+        gliner_device=gliner_device or strategy_result.get("gliner_device"),
+        max_words=int(strategy_result.get("max_words", DATABASE_STYLE_GLINER_MAX_WORDS)),
+        overlap_words=int(strategy_result.get("overlap_words", DATABASE_STYLE_GLINER_OVERLAP_WORDS)),
+        verbose=verbose,
+    )
+    relation_predictions = predict_glirel_for_masking_inputs(
+        glirel_model,
+        glirel_inputs,
+        relation_labels=relation_labels,
+        threshold=float(strategy_result.get("glirel_threshold", 0.05)),
+        top_k=int(strategy_result.get("glirel_top_k", 3)),
+        batch_size=int(strategy_result.get("glirel_batch_size", 4)),
+        verbose=verbose,
+    )
+    scores = _relation_scores_by_mention(
+        gliner_predictions,
+        relation_predictions,
+        strategy_result.get("relation_side_weights") or {},
+        fallback_by_type=strategy_result.get("semantic_type_priors") or {},
+    )
+    predictions_by_chunk = _predictions_by_chunk_with_scores(gliner_predictions, scores)
+    metrics = compute_masking_metrics(records_df, predictions_by_chunk, threshold=threshold, verbose=False)
+    return {
+        "strategy": "Semantic GLiNER + GLiREL",
+        "threshold": threshold,
+        "metrics": metrics,
+        "predictions_by_chunk": predictions_by_chunk,
+        "glirel_inputs": glirel_inputs,
+        "relation_predictions": relation_predictions,
+    }
+
+
+def evaluate_policy_gliner_glirel_strategy_on_records(
+    records_df: pd.DataFrame,
+    policy_gliner_model: Any,
+    glirel_model: Any,
+    labels: Sequence[str],
+    strategy_result: Mapping[str, Any],
+    *,
+    relation_labels: Sequence[str] | None = None,
+    gliner_device: str | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Apply saved Strategy 3 settings to evaluation records."""
+
+    best = strategy_result.get("best") or {}
+    threshold = float(best.get("threshold", 0.5))
+    combination_mode = str(strategy_result.get("combination_mode") or "weighted_sum")
+    alpha = float(best.get("alpha", 0.5) if best.get("alpha") is not None else 0.5)
+    beta = float(best.get("beta", 1.0) if best.get("beta") is not None else 1.0)
+    gliner_predictions, glirel_inputs = build_gliner_predictions_for_glirel(
+        records_df,
+        policy_gliner_model,
+        labels,
+        label_mode="policy_composite",
+        gliner_threshold=float(strategy_result.get("gliner_threshold", 0.3)),
+        gliner_device=gliner_device or strategy_result.get("gliner_device"),
+        max_words=int(strategy_result.get("max_words", DATABASE_STYLE_GLINER_MAX_WORDS)),
+        overlap_words=int(strategy_result.get("overlap_words", DATABASE_STYLE_GLINER_OVERLAP_WORDS)),
+        verbose=verbose,
+    )
+    relation_predictions = predict_glirel_for_masking_inputs(
+        glirel_model,
+        glirel_inputs,
+        relation_labels=relation_labels,
+        threshold=float(strategy_result.get("glirel_threshold", 0.05)),
+        top_k=int(strategy_result.get("glirel_top_k", 3)),
+        batch_size=int(strategy_result.get("glirel_batch_size", 4)),
+        verbose=verbose,
+    )
+    relation_scores = _relation_scores_by_mention(
+        gliner_predictions,
+        relation_predictions,
+        strategy_result.get("relation_side_weights") or {},
+        fallback_by_type=strategy_result.get("semantic_type_priors") or {},
+    )
+    policy_scores = _policy_prior_scores(gliner_predictions)
+    scores = {
+        mention_id: _combine_scores(
+            policy_scores.get(mention_id, 0.0),
+            relation_scores.get(mention_id, 0.0),
+            alpha=alpha,
+            beta=beta,
+            mode=combination_mode,
+        )
+        for mention_id in policy_scores.keys() | relation_scores.keys()
+    }
+    predictions_by_chunk = _predictions_by_chunk_with_scores(gliner_predictions, scores)
+    metrics = compute_masking_metrics(records_df, predictions_by_chunk, threshold=threshold, verbose=False)
+    return {
+        "strategy": "Policy GLiNER + GLiREL",
+        "threshold": threshold,
+        "metrics": metrics,
+        "predictions_by_chunk": predictions_by_chunk,
+        "glirel_inputs": glirel_inputs,
+        "relation_predictions": relation_predictions,
+    }
+
+
 def train_policy_gliner_glirel_strategy(
     records_df: pd.DataFrame,
     policy_gliner_model: Any,
