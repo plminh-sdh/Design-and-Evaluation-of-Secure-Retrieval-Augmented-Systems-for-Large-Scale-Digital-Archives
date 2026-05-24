@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from qdrant_client import models
 
 from src.bge_m3_embedding import BGEM3Embedder
+from src.retrieval_cache import (
+    append_retrieval_cache_result,
+    default_hybrid_retrieval_cache_path,
+    load_retrieval_cache_result,
+)
 from src.retrieval_dense import QDRANT_DENSE_VECTOR_NAME
 from src.retrieval_drivers import QdrantRetrievalDriver
 from src.retrieval_sparse import (
@@ -33,6 +39,13 @@ class QdrantHybridRrfRetriever:
     min_prefetch_limit: int = 20
     rrf_k: int | None = None
     retrieval_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
+    retrieval_cache_path: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.retrieval_cache_path is None:
+            self.retrieval_cache_path = default_hybrid_retrieval_cache_path(
+                prefetch_multiplier=self.prefetch_multiplier,
+            )
 
     def _cache_enabled(
         self,
@@ -44,12 +57,28 @@ class QdrantHybridRrfRetriever:
         return query_filter is None and with_payload and prefetch_limit is None
 
     def _cached_results(self, query_id: str, top_k: int) -> pd.DataFrame | None:
+        if self.retrieval_cache_path is not None:
+            cached_df, _ = load_retrieval_cache_result(
+                self.retrieval_cache_path,
+                query_id=str(query_id),
+                top_k=top_k,
+            )
+            return cached_df
         cached_df = self.retrieval_cache.get(str(query_id))
         if cached_df is None or len(cached_df) < top_k:
             return None
         return cached_df.head(top_k).copy()
 
     def _store_cache(self, query_id: str, results_df: pd.DataFrame) -> None:
+        if self.retrieval_cache_path is not None:
+            append_retrieval_cache_result(
+                self.retrieval_cache_path,
+                cache_source=self.method_name,
+                retriever_class=type(self).__name__,
+                query_id=str(query_id),
+                results_df=results_df,
+            )
+            return
         cached_df = self.retrieval_cache.get(str(query_id))
         if cached_df is None or len(results_df) > len(cached_df):
             self.retrieval_cache[str(query_id)] = results_df.copy()

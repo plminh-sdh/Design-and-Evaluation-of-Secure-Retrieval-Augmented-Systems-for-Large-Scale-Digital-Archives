@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import re
 import time
 from typing import Any, Mapping, Sequence
@@ -12,6 +13,12 @@ from qdrant_client import models
 
 from src.archive_schema import stable_id
 from src.graph_kb_canonicalization import _entity_from_refined_span
+from src.retrieval_cache import (
+    append_retrieval_cache_result,
+    default_graph_expanded_retrieval_cache_path,
+    default_graph_reranked_retrieval_cache_path,
+    load_retrieval_cache_result,
+)
 from src.retrieval_drivers import Neo4jGraphRetrievalDriver
 from src.retrieval_hybrid import QdrantHybridRrfRetriever
 from src.retrieval_sparse import qdrant_points_to_retrieval_results
@@ -457,6 +464,16 @@ class GraphExpandedHybridRetriever:
     last_debug: dict[str, Any] = field(default_factory=dict)
     retrieval_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
     debug_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    retrieval_cache_path: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.retrieval_cache_path is None:
+            self.retrieval_cache_path = default_graph_expanded_retrieval_cache_path(
+                prefetch_multiplier=self.prefetch_multiplier,
+                entity_limit=self.graph_expander.entity_limit,
+                alias_limit=self.graph_expander.alias_limit,
+                neighbor_limit=self.graph_expander.neighbor_limit,
+            )
 
     def _cache_enabled(
         self,
@@ -467,6 +484,15 @@ class GraphExpandedHybridRetriever:
         return query_filter is None and with_payload
 
     def _cached_results(self, query_id: str, top_k: int) -> pd.DataFrame | None:
+        if self.retrieval_cache_path is not None:
+            cached_df, debug_state = load_retrieval_cache_result(
+                self.retrieval_cache_path,
+                query_id=str(query_id),
+                top_k=top_k,
+            )
+            if cached_df is not None:
+                self.last_debug = debug_state
+            return cached_df
         cached_df = self.retrieval_cache.get(str(query_id))
         if cached_df is None or len(cached_df) < top_k:
             return None
@@ -479,6 +505,16 @@ class GraphExpandedHybridRetriever:
         results_df: pd.DataFrame,
         expansion: Mapping[str, Any],
     ) -> None:
+        if self.retrieval_cache_path is not None:
+            append_retrieval_cache_result(
+                self.retrieval_cache_path,
+                cache_source=self.method_name,
+                retriever_class=type(self).__name__,
+                query_id=str(query_id),
+                results_df=results_df,
+                debug=expansion,
+            )
+            return
         cached_df = self.retrieval_cache.get(str(query_id))
         if cached_df is None or len(results_df) > len(cached_df):
             self.retrieval_cache[str(query_id)] = results_df.copy()
@@ -641,6 +677,16 @@ class GraphExpandedHybridReranker:
     last_debug: dict[str, Any] = field(default_factory=dict)
     retrieval_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
     debug_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    retrieval_cache_path: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.retrieval_cache_path is None:
+            self.retrieval_cache_path = default_graph_reranked_retrieval_cache_path(
+                candidate_multiplier=self.candidate_multiplier,
+                matched_entity_boost=self.matched_entity_boost,
+                neighbor_entity_boost=self.neighbor_entity_boost,
+                typed_relation_boost=self.typed_relation_boost,
+            )
 
     def _cache_enabled(
         self,
@@ -651,6 +697,15 @@ class GraphExpandedHybridReranker:
         return query_filter is None and with_payload
 
     def _cached_results(self, query_id: str, top_k: int) -> pd.DataFrame | None:
+        if self.retrieval_cache_path is not None:
+            cached_df, debug_state = load_retrieval_cache_result(
+                self.retrieval_cache_path,
+                query_id=str(query_id),
+                top_k=top_k,
+            )
+            if cached_df is not None:
+                self.last_debug = debug_state
+            return cached_df
         cached_df = self.retrieval_cache.get(str(query_id))
         if cached_df is None or len(cached_df) < top_k:
             return None
@@ -663,6 +718,16 @@ class GraphExpandedHybridReranker:
         results_df: pd.DataFrame,
         debug_state: Mapping[str, Any],
     ) -> None:
+        if self.retrieval_cache_path is not None:
+            append_retrieval_cache_result(
+                self.retrieval_cache_path,
+                cache_source=self.method_name,
+                retriever_class=type(self).__name__,
+                query_id=str(query_id),
+                results_df=results_df,
+                debug=debug_state,
+            )
+            return
         cached_df = self.retrieval_cache.get(str(query_id))
         if cached_df is None or len(results_df) > len(cached_df):
             self.retrieval_cache[str(query_id)] = results_df.copy()
