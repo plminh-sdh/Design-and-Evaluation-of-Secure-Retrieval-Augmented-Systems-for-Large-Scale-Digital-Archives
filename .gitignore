@@ -14,5 +14,7 @@ htmlcov/
 .ipynb_checkpoints/
 
 # data and context files
-data/
+data/csv_cache
+data/model_cache
+data/**/*.csv
 *.md
