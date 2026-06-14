@@ -5,12 +5,101 @@ from __future__ import annotations
 import json
 import os
 import re
+import gc
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 
 QUERY_GENERATION_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 RELEVANCE_JUDGE_MODEL_ID = "gpt-5-nano"
+LOCAL_RELEVANCE_JUDGE_MODEL_IDS = {
+    "phi4_mini": "microsoft/Phi-4-mini-instruct",
+    "olmo2_1b": "allenai/OLMo-2-0425-1B-Instruct",
+    "llama32_3b": "meta-llama/Llama-3.2-3B-Instruct",
+    "smollm2_17b": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+}
+
+
+def configure_project_huggingface_cache(
+    project_root: str | Path = ".",
+    cache_dir: str | Path = "data/models/huggingface",
+) -> Path:
+    """Route all common Hugging Face caches inside the project directory."""
+
+    root = Path(project_root).resolve()
+    candidate = Path(cache_dir)
+    resolved_cache = (
+        candidate if candidate.is_absolute() else root / candidate
+    ).resolve()
+    if not resolved_cache.is_relative_to(root):
+        raise ValueError(
+            "The Hugging Face cache must be inside project_root. "
+            f"project_root={root}, cache_dir={resolved_cache}"
+        )
+
+    cache_paths = {
+        "HF_HOME": resolved_cache,
+        "HF_HUB_CACHE": resolved_cache / "hub",
+        "HUGGINGFACE_HUB_CACHE": resolved_cache / "hub",
+        "TRANSFORMERS_CACHE": resolved_cache / "hub",
+        "HF_MODULES_CACHE": resolved_cache / "modules",
+        "HF_ASSETS_CACHE": resolved_cache / "assets",
+        "HF_XET_CACHE": resolved_cache / "xet",
+        "HF_DATASETS_CACHE": resolved_cache / "datasets",
+        "SENTENCE_TRANSFORMERS_HOME": resolved_cache / "sentence_transformers",
+    }
+    for name, path in cache_paths.items():
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[name] = str(path)
+    return resolved_cache
+
+
+def assert_huggingface_runtime_cache(cache_dir: str | Path) -> None:
+    """Fail if imported Hugging Face libraries retained a different cache."""
+
+    expected_root = Path(cache_dir).resolve()
+    expected_paths = {
+        "HF_HOME": expected_root,
+        "HF_HUB_CACHE": expected_root / "hub",
+        "HF_ASSETS_CACHE": expected_root / "assets",
+        "HF_XET_CACHE": expected_root / "xet",
+    }
+
+    try:
+        import huggingface_hub.constants as hub_constants
+    except ImportError:
+        return
+
+    stale_paths: list[str] = []
+    for name, expected in expected_paths.items():
+        actual = Path(str(getattr(hub_constants, name, ""))).resolve()
+        if actual != expected:
+            stale_paths.append(f"{name}={actual} (expected {expected})")
+
+    try:
+        import transformers.dynamic_module_utils as dynamic_module_utils
+
+        actual_modules = Path(
+            str(getattr(dynamic_module_utils, "HF_MODULES_CACHE", ""))
+        ).resolve()
+        expected_modules = expected_root / "modules"
+        if actual_modules != expected_modules:
+            stale_paths.append(
+                f"HF_MODULES_CACHE={actual_modules} (expected {expected_modules})"
+            )
+    except ImportError:
+        pass
+
+    if stale_paths:
+        details = "\n- ".join(stale_paths)
+        raise RuntimeError(
+            "Hugging Face was imported before the project cache was configured. "
+            "Restart the notebook kernel, then run the Section 1 import/setup cell "
+            "before loading any model. Refusing to download into a stale cache:\n- "
+            f"{details}"
+        )
+
 
 QUERY_GENERATION_ALLOWED_QUERY_TYPES = [
     "factual_lookup",
@@ -48,14 +137,18 @@ class HuggingFaceChatLLM:
         load_in_4bit: bool = False,
         require_cuda: bool = False,
         allow_cpu_offload: bool = False,
+        cache_dir: str | Path | None = None,
+        attn_implementation: str | None = None,
+        chat_template_kwargs: Mapping[str, Any] | None = None,
         generation_config: GenerationConfig | None = None,
     ) -> None:
         self.model_id = model_id
         self.token = token or os.getenv("HUGGING_FACE_TOKEN")
         self.generation_config = generation_config or GenerationConfig()
+        self.cache_dir = Path(cache_dir).resolve() if cache_dir else None
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
 
         import torch
-        from huggingface_hub import login
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         if require_cuda and not torch.cuda.is_available():
@@ -70,16 +163,14 @@ class HuggingFaceChatLLM:
             # post-load device checks can run.
             device_map = {"": 0}
 
-        if self.token:
-            login(token=self.token, add_to_git_credential=False)
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         quantization_config = None
         if load_in_4bit:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16
-                if torch.cuda.is_available()
-                else torch.float16,
+                bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
@@ -87,16 +178,22 @@ class HuggingFaceChatLLM:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             token=self.token,
+            cache_dir=str(self.cache_dir) if self.cache_dir else None,
             trust_remote_code=True,
         )
+        model_kwargs: dict[str, Any] = {}
+        if attn_implementation:
+            model_kwargs["attn_implementation"] = attn_implementation
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 token=self.token,
+                cache_dir=str(self.cache_dir) if self.cache_dir else None,
                 device_map=device_map,
                 torch_dtype=torch_dtype,
                 quantization_config=quantization_config,
                 trust_remote_code=True,
+                **model_kwargs,
             )
         except Exception as exc:
             message = str(exc)
@@ -183,6 +280,7 @@ class HuggingFaceChatLLM:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                **self.chat_template_kwargs,
             )
         except Exception as exc:
             if "System role not supported" not in str(exc):
@@ -191,6 +289,7 @@ class HuggingFaceChatLLM:
                 self._fold_system_prompt_into_user(messages),
                 tokenize=False,
                 add_generation_prompt=True,
+                **self.chat_template_kwargs,
             )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
@@ -210,6 +309,31 @@ class HuggingFaceChatLLM:
 
         generated_ids = output_ids[0, inputs["input_ids"].shape[-1] :]
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    def unload(self) -> None:
+        """Release model and tokenizer references, then empty the CUDA cache."""
+
+        model = getattr(self, "model", None)
+        tokenizer = getattr(self, "tokenizer", None)
+        if model is not None:
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+        self.model = None
+        self.tokenizer = None
+        del model
+        del tokenizer
+        gc.collect()
+
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
     def prompt(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         return self.chat(
@@ -560,6 +684,204 @@ class OpenAIRelevanceJudgeLLM:
                 request.pop("reasoning", None)
             response = self.client.responses.create(**request)
         return self._response_to_text(response)
+
+
+def _relevance_judge_prompts(
+    query: str,
+    expected_relevant_information: str,
+    retrieved_chunk_text: str,
+) -> tuple[str, str]:
+    """Build the shared rubric used by hosted and local relevance judges."""
+
+    system_prompt = (
+        "You are a strict retrieval evaluator for an archive search system. "
+        "Judge only retrieval relevance: whether the retrieved chunk contains "
+        "information that satisfies the query. Do not judge writing style or "
+        "whether the final answer is beautifully phrased. Return exactly one "
+        "valid JSON object. Do not wrap it in Markdown. Do not add commentary."
+    )
+    user_prompt = (
+        "Judge whether the retrieved chunk satisfies the query and contains the "
+        "expected relevant information.\n\n"
+        "Relevance rubric:\n"
+        "3 = Perfectly relevant: directly answers the query and contains the expected information.\n"
+        "2 = Highly relevant: contains useful answer information, but it is incomplete, indirect, "
+        "or mixed with extraneous content.\n"
+        "1 = Related: about the same topic, entity, event, or context, but does not answer the query.\n"
+        "0 = Irrelevant: does not provide useful information for the query.\n\n"
+        "Judging rules:\n"
+        "- Base the score only on the retrieved chunk text below.\n"
+        "- Do not reward a chunk merely because it shares a dataset, title, entity name, or broad topic.\n"
+        "- Give score 3 only when the expected information is explicitly present or unambiguously entailed.\n"
+        "- Give score 2 when the chunk would help answer the query but misses part of the expected information.\n"
+        "- Give score 1 when it is topically related but cannot answer the query.\n"
+        "- Give score 0 when it is unrelated or too vague/noisy to support the query.\n"
+        "- If the retrieved text contains masked/redacted spans, judge the visible evidence only.\n\n"
+        "Return this JSON schema:\n"
+        "{\n"
+        '  "relevance_score": 0,\n'
+        '  "relevance_label": "irrelevant|related|highly_relevant|perfectly_relevant",\n'
+        '  "contains_expected_information": false,\n'
+        '  "missing_information": "What is missing, or empty string if nothing is missing.",\n'
+        '  "supporting_evidence": "Short evidence from the retrieved chunk, or empty string.",\n'
+        '  "rationale": "One concise explanation of the score."\n'
+        "}\n\n"
+        f"Query: {query}\n\n"
+        f"Expected relevant information: {expected_relevant_information}\n\n"
+        f"Retrieved chunk:\n{retrieved_chunk_text[:12000]}"
+    )
+    return system_prompt, user_prompt
+
+
+class HuggingFaceRelevanceJudgeLLM(HuggingFaceChatLLM):
+    """Deterministic local relevance judge using the same 0-3 rubric."""
+
+    def judge_relevance(
+        self,
+        query: str,
+        expected_relevant_information: str,
+        retrieved_chunk_text: str,
+        *,
+        max_new_tokens: int = 256,
+        temperature: float | None = None,
+        top_p: float | None = 1.0,
+        do_sample: bool | None = False,
+    ) -> str:
+        system_prompt = (
+            "You are a strict retrieval relevance evaluator. Return exactly one "
+            "single-line JSON object containing only the integer relevance_score. "
+            "The only valid outputs are {\"relevance_score\": 0}, "
+            "{\"relevance_score\": 1}, {\"relevance_score\": 2}, or "
+            "{\"relevance_score\": 3}. Do not explain the score. Do not use Markdown."
+        )
+        user_prompt = (
+            "Assign one retrieval relevance score using this rubric:\n"
+            "3 = directly answers the query and contains the expected information.\n"
+            "2 = useful answer information, but incomplete, indirect, or mixed with extraneous content.\n"
+            "1 = related topic, entity, event, or context, but does not answer the query.\n"
+            "0 = irrelevant or too vague/noisy to help answer the query.\n\n"
+            "Judge only visible evidence in the retrieved chunk. Do not reward broad "
+            "topic or entity overlap.\n\n"
+            f"Query: {query}\n\n"
+            f"Expected relevant information: {expected_relevant_information}\n\n"
+            f"Retrieved chunk:\n{retrieved_chunk_text[:12000]}\n\n"
+            "Return one of the four exact JSON objects listed in the system instruction."
+        )
+        return self.prompt(
+            system_prompt,
+            user_prompt,
+            max_new_tokens=min(max(int(max_new_tokens or 0), 16), 64),
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+
+
+class LocalRelevanceJudgeManager:
+    """Keep at most one project-cached local relevance judge in memory."""
+
+    def __init__(
+        self,
+        *,
+        project_root: str | Path = ".",
+        cache_dir: str | Path = "data/models/huggingface",
+        token: str | None = None,
+    ) -> None:
+        self.project_root = Path(project_root).resolve()
+        self.cache_dir = configure_project_huggingface_cache(
+            self.project_root,
+            cache_dir,
+        )
+        assert_huggingface_runtime_cache(self.cache_dir)
+        self.hub_cache_dir = self.cache_dir / "hub"
+        self.token = token or os.getenv("HUGGING_FACE_TOKEN")
+        self.active_judge: HuggingFaceRelevanceJudgeLLM | None = None
+
+    def unload(self) -> None:
+        if self.active_judge is not None:
+            self.active_judge.unload()
+            self.active_judge = None
+        gc.collect()
+
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def load(self, model_id: str) -> HuggingFaceRelevanceJudgeLLM:
+        """Unload the active local judge and load the requested model on GPU."""
+
+        self.unload()
+        model_options: dict[str, Any] = {}
+        if model_id == "microsoft/Phi-4-mini-instruct":
+            model_options["attn_implementation"] = "eager"
+
+        self.active_judge = HuggingFaceRelevanceJudgeLLM(
+            model_id,
+            token=self.token,
+            cache_dir=self.hub_cache_dir,
+            device_map={"": 0},
+            torch_dtype="auto",
+            load_in_4bit=True,
+            require_cuda=True,
+            allow_cpu_offload=False,
+            generation_config=GenerationConfig(
+                max_new_tokens=64,
+                temperature=0.0,
+                top_p=1.0,
+                do_sample=False,
+            ),
+            **model_options,
+        )
+        return self.active_judge
+
+
+def release_named_cuda_models(
+    namespace: dict[str, Any],
+    object_names: list[str],
+) -> list[str]:
+    """Unload named notebook model objects before sequential judge loading."""
+
+    released: list[str] = []
+    seen_objects: set[int] = set()
+    for name in object_names:
+        obj = namespace.get(name)
+        if obj is None or id(obj) in seen_objects:
+            namespace[name] = None
+            continue
+        seen_objects.add(id(obj))
+
+        unload = getattr(obj, "unload", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception:
+                pass
+        else:
+            model = getattr(obj, "model", obj)
+            to_method = getattr(model, "to", None)
+            if callable(to_method):
+                try:
+                    to_method("cpu")
+                except Exception:
+                    pass
+        namespace[name] = None
+        released.append(name)
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    return released
 
 
 RelevanceJudgeLLM = OpenAIRelevanceJudgeLLM

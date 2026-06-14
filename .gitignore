@@ -18,3 +18,28 @@ data/csv_cache
 data/model_cache
 data/**/*.csv
 *.md
+
+# Local model downloads and training artifacts
+data/models/
+data/**/fine_tuned_*models/
+data/**/fine-tuned-*models/
+data/**/checkpoint-*/
+data/**/checkpoints/
+data/**/*.safetensors
+data/**/*.bin
+data/**/*.pt
+data/**/*.pth
+data/**/*.ckpt
+data/**/*.onnx
+.cache/huggingface/
+wandb/
+
+# Reproducible retrieval payloads and tuning caches
+data/evaluation/retrieval_runs/retriever_caches/
+data/evaluation/retrieval_runs/ablation_retrieval_results/
+data/evaluation/retrieval_runs/retrieval_test_elapsed_time.png
+
+# Lightweight retrieval results retained for evaluation and reporting
+!data/evaluation/retrieval_runs/retrieval_k_tuning_metrics_retained.csv
+!data/evaluation/retrieval_runs/retrieval_test_metrics_by_judge.csv
+!data/evaluation/retrieval_runs/retrieval_test_metrics_five_judge_average.csv

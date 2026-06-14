@@ -1,0 +1,16 @@
+strategy,strategy_label,configuration,k,queries,judged_results,mean_ndcg,precision_at_k,hit_rate_at_k,mrr_at_k,source_chunk_hit_at_k,relevance_threshold
+sparse,Sparse,default,1,89,89,0.820225,0.797753,0.797753,0.797753,0.359551,2
+sparse,Sparse,default,3,89,267,0.869649,0.670412,0.921348,0.853933,0.584270,2
+sparse,Sparse,default,5,89,445,0.873736,0.595506,0.988764,0.869101,0.629213,2
+dense,Dense,default,1,89,89,0.831461,0.752809,0.752809,0.702247,0.314607,2
+dense,Dense,default,3,89,267,0.847150,0.681648,0.921348,0.782772,0.516854,2
+dense,Dense,default,5,89,445,0.842772,0.633708,0.943820,0.787828,0.561798,2
+hybrid_rrf,Hybrid RRF,prefetch=3,1,89,89,0.831461,0.797753,0.797753,0.797753,0.359551,2
+hybrid_rrf,Hybrid RRF,prefetch=3,3,89,267,0.879536,0.704120,0.943820,0.915730,0.595506,2
+hybrid_rrf,Hybrid RRF,prefetch=3,5,89,445,0.870950,0.647191,0.966292,0.922285,0.696629,2
+graph_expanded_hybrid,Graph-expanded Hybrid,prefetch=3,1,89,89,0.764045,0.707865,0.707865,0.679775,0.258427,2
+graph_expanded_hybrid,Graph-expanded Hybrid,prefetch=3,3,89,267,0.815432,0.636704,0.876404,0.792135,0.494382,2
+graph_expanded_hybrid,Graph-expanded Hybrid,prefetch=3,5,89,445,0.821393,0.579775,0.932584,0.804494,0.528090,2
+graph_expanded_hybrid_reranked,Graph-reranked Hybrid,candidate=5; boosts=0.10/0.05/0.05,1,89,89,0.685393,0.595506,0.595506,0.533708,0.202247,2
+graph_expanded_hybrid_reranked,Graph-reranked Hybrid,candidate=5; boosts=0.10/0.05/0.05,3,89,267,0.762001,0.565543,0.808989,0.672285,0.370787,2
+graph_expanded_hybrid_reranked,Graph-reranked Hybrid,candidate=5; boosts=0.10/0.05/0.05,5,89,445,0.790858,0.534831,0.910112,0.697191,0.382022,2
