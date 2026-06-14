@@ -1859,11 +1859,11 @@ def compute_masking_metrics(
     score_field: str = "sensitivity_score",
     verbose: bool = False,
 ) -> dict[str, Any]:
-    """Compute the six masking metrics used for final strategy comparison.
+    """Compute the masking metrics used for final strategy comparison.
 
     SSR/SSP/Detection F1 are relaxed span-level detection metrics. RSTR measures
-    retained sensitive character rate, while MCR and MCR* report total and
-    non-sensitive character masking rates.
+    retained sensitive character rate, while MCR reports total character masking
+    rate.
     """
 
     detection = evaluate_sensitive_span_predictions(
@@ -1877,8 +1877,6 @@ def compute_masking_metrics(
     covered_sensitive_chars = 0
     total_chars = 0
     masked_chars = 0
-    nonsensitive_chars = 0
-    masked_nonsensitive_chars = 0
 
     for row in records_df.to_dict(orient="records"):
         chunk_id = str(row.get("chunk_id") or "")
@@ -1899,16 +1897,12 @@ def compute_masking_metrics(
         sensitive_chars += chunk_sensitive_chars
         covered_sensitive_chars += chunk_covered_sensitive_chars
         masked_chars += chunk_masked_chars
-        chunk_nonsensitive_chars = max(len(text) - chunk_sensitive_chars, 0)
-        nonsensitive_chars += chunk_nonsensitive_chars
-        masked_nonsensitive_chars += max(chunk_masked_chars - chunk_covered_sensitive_chars, 0)
 
     ssr = detection["recall"]
     ssp = detection["precision"]
     detection_f1 = detection["f1"]
     rstr = 1.0 - (covered_sensitive_chars / sensitive_chars) if sensitive_chars else 0.0
     mcr = masked_chars / total_chars if total_chars else 0.0
-    mcr_star = masked_nonsensitive_chars / nonsensitive_chars if nonsensitive_chars else 0.0
     return {
         "threshold": float(threshold),
         "tp": detection["tp"],
@@ -1919,14 +1913,11 @@ def compute_masking_metrics(
         "Detection_F1": detection_f1,
         "RSTR": rstr,
         "MCR": mcr,
-        "MCR_star": mcr_star,
         "loss": 1.0 - detection_f1,
         "sensitive_chars": int(sensitive_chars),
         "covered_sensitive_chars": int(covered_sensitive_chars),
         "total_chars": int(total_chars),
         "masked_chars": int(masked_chars),
-        "nonsensitive_chars": int(nonsensitive_chars),
-        "masked_nonsensitive_chars": int(masked_nonsensitive_chars),
     }
 
 
